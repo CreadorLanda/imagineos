@@ -9,6 +9,31 @@
 - QEMU x86_64 e OVMF para testar o boot UEFI.
 - `qemu-img`, `sgdisk`, `mkfs.vfat` e `mtools` para criar a imagem de disco GPT.
 
+## Estrutura do build
+
+O build é dividido por etapa em `build/`, e o `Makefile` da raiz apenas delega
+a cada um deles. Cada arquivo também roda isolado:
+
+| Makefile | Responsabilidade | Alvos |
+| --- | --- | --- |
+| `build/common.mk` | variáveis, ferramentas e artefatos compartilhados | (incluído, sem alvos) |
+| `build/kernel.mk` | kernel `dreamcore`, `bootstrap.elf` e `dzImage` | `kernel`, `bootstrap`, `dzimage`, `tools` |
+| `build/userland.mk` | apps, utilitários, libc, runtime C e TinyCC | `user-programs`, `user-libs`, `tcc-source`, `c-app` |
+| `build/ramfs.mk` | árvore `ramfs/` e empacotamento do USTAR | `ramfs`, `ramfs-image` |
+| `build/iso.mk` | ISO UEFI e execução no QEMU | `iso`, `run`, `disk-image`, `run-disk`, `run-installer` |
+
+Pela raiz, os mesmos alvos existem e são encaminhados: `make kernel`,
+`make user-programs`, `make ramfs`, `make iso`, além dos agregadores `image`
+(tudo o que entra na imagem, sem montar a ISO) e `release` (ISO pronta). Para
+rodar uma etapa sozinha, use o arquivo direto:
+
+```sh
+make -f build/kernel.mk dzimage
+make -f build/userland.mk user-programs
+make -f build/ramfs.mk ramfs-image
+make -f build/iso.mk iso
+```
+
 ## Compilar a ISO
 
 Na raiz do repositório, crie `ramfs/` caso ainda não exista. Essa pasta é a
@@ -37,9 +62,8 @@ para `system/fonts/zap-vga16.psf` dentro do USTAR, de modo que o instalador
 inclui a fonte na raiz DFS persistente.
 
 Apps C em `ramfs/home/<nome>.c` implementam `main`; `make c-app APP=<nome>` os
-compila pelo TCC upstream no host e linka como ELF estatico para o Dreamcore.
-`USER_C_APPS="vim outro" make .build/ramfs.tar` empacota os ELFs em `/bin`; o
-padrao inclui `vim`, cujo fonte `ramfs/home/vim.c` tambem fica no tar. A
+compila pelo TCC upstream no host e linka como ELF estatico para o Dreamcore
+(pela raiz ou direto, `make -f build/userland.mk c-app APP=<nome>`). A
 libc fornece o entrypoint `_start` por `crt0.c`. A interface inicial em
 `userland/libc/` inclui `read`, `write`, `_exit`, `printf`, `puts`, entrada e
 saida de caracteres, operacoes basicas de `<string.h>` e `<stdlib.h>`, e as
@@ -53,9 +77,9 @@ produzir o ELF, e `third_party/musl-1.2.6` e apenas fonte de referencia: o build
 nativo dela usa syscalls Linux e nao e linkado aos apps Dreamcore. TCC e musl sao
 compativeis entre si em Linux, mas o ImagineOS precisa de mais syscalls POSIX,
 descritores de arquivo, memoria dinamica e startup antes de executar esses
-projetos upstream dentro da ramfs. As fontes ignoradas podem ser recuperadas
-com `make musl-source`; o build do app baixa o TCC para `third_party/` quando
-essa arvore ainda nao existe.
+projetos upstream dentro da ramfs. As fontes ignoradas do TCC podem ser
+recuperadas com `make tcc-source`, que faz o checkout da revisao fixada em
+`TCC_SOURCE_REV`; `third_party/` fica fora do controle de versao.
 
 ## Executar com QEMU
 
