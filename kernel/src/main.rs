@@ -8,6 +8,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 mod accounts;
 #[path = "arch/mod.rs"]
 mod arch;
+#[path = "ipc.rs"]
+mod ipc;
 #[path = "drivers/ata.rs"]
 pub mod ata;
 #[path = "drivers/block.rs"]
@@ -293,6 +295,22 @@ fn mask_legacy_pic() {
         out(0x21, 0xff);
         out(0xa1, 0xff);
     }
+}
+
+/// Escreve um valor hexadecimal de 16 dígitos na serial (diagnóstico).
+#[cfg(feature = "kernel-debug")]
+pub(crate) fn serial_hex(mut value: u64) {
+    let mut digits = [0u8; 16];
+    for index in (0..digits.len()).rev() {
+        let digit = (value & 0xf) as u8;
+        digits[index] = if digit < 10 {
+            b'0' + digit
+        } else {
+            b'a' + digit - 10
+        };
+        value >>= 4;
+    }
+    serial_write(&digits);
 }
 
 pub(crate) fn serial_write(bytes: &[u8]) {

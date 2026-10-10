@@ -78,6 +78,114 @@ impl AddressSpace {
         Ok(frame.virtual_address)
     }
 
+    /// Cria um novo espaço de endereço com uma **cópia** de todas as páginas de
+    /// usuário mapeadas neste.
+    ///
+    /// É um `fork` clássico sem copy-on-write: cada página de usuário recebe um
+    /// frame novo com o conteúdo duplicado. O half superior (kernel) é
+    /// compartilhado, como em [`AddressSpace::new_user`].
+    ///
+    /// Devolve `None` se faltar memória; nesse caso os frames já alocados são
+    /// liberados, mas o novo espaço de endereço parcial pode permanecer com
+    /// tabelas de páginas alocadas (elas são poucas e permanecem ligadas à
+    /// tabela raiz, que é descartada).
+    pub fn clone_user(&self) -> Option<Self> {
+        let clone = Self::new_user()?;
+        if !self.copy_user_pages(&clone) {
+            return None;
+        }
+        Some(clone)
+    }
+
+    /// Percorre a metade de usuário da árvore e copia cada página presente.
+    fn copy_user_pages(&self, destination: &Self) -> bool {
+        // A metade de usuário do PML4 ocupa as 256 primeiras entradas.
+        for pml4_index in 0..256usize {
+            if !self.copy_table(
+                self.root_physical,
+                destination.root_physical,
+                pml4_index,
+                3,
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Copia recursivamente uma entrada de tabela até chegar a nível 1 (PTE).
+    ///
+    /// `level` indica o nível da tabela que está sendo percorrida: 3 = PDPT,
+    /// 2 = PD, 1 = PT. Ao chegar nas PTEs, cada página mapeada é copiada para um
+    /// frame novo.
+    fn copy_table(
+        &self,
+        source_physical: u64,
+        destination_physical: u64,
+        index: usize,
+        level: u8,
+    ) -> bool {
+        let Some(source_table) = table_pointer(source_physical) else {
+            return false;
+        };
+        let source_entry = unsafe { *source_table.add(index) };
+        if source_entry & ENTRY_PRESENT == 0 {
+            return true;
+        }
+
+        let Some(destination_table) = table_pointer(destination_physical) else {
+            return false;
+        };
+        let destination_entry = unsafe { &mut *destination_table.add(index) };
+
+        if level == 1 {
+            // PTE: aloca um frame novo e copia o conteúdo da página.
+            let Some(frame) = memory::allocate_frame() else {
+                return false;
+            };
+            let Some(source_page) = table_pointer(source_entry & ADDRESS_MASK) else {
+                return false;
+            };
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    source_page.cast::<u8>(),
+                    frame.virtual_address,
+                    PAGE_SIZE as usize,
+                );
+            }
+            // Preserva os bits de controle da PTE original (presente, escrita,
+            // usuário), trocando apenas o endereço físico da página.
+            *destination_entry = (source_entry & !ADDRESS_MASK) | frame.physical_address;
+            return true;
+        }
+
+        if source_entry & ENTRY_HUGE != 0 {
+            // Páginas enormes (2 MiB) na metade de usuário não são usadas pelo
+            // loader, que mapeia sempre páginas de 4 KiB. Recusar aqui é mais
+            // seguro do que copiar errado.
+            return false;
+        }
+
+        // Tabela intermediária: garante uma tabela própria no destino e desce.
+        let next_source = source_entry & ADDRESS_MASK;
+        if *destination_entry & ENTRY_PRESENT == 0 {
+            let Some(frame) = memory::allocate_frame() else {
+                return false;
+            };
+            unsafe {
+                ptr::write_bytes(frame.virtual_address, 0, PAGE_SIZE as usize);
+            }
+            *destination_entry = frame.physical_address | ENTRY_PRESENT | ENTRY_WRITABLE | ENTRY_USER;
+        }
+        let next_destination = *destination_entry & ADDRESS_MASK;
+        for child in 0..512usize {
+            if !self.copy_table(next_source, next_destination, child, level - 1) {
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn translate(&self, virtual_address: u64) -> Option<*mut u8> {
         let indices = [
             ((virtual_address >> 39) & 0x1ff) as usize,

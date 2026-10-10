@@ -41,6 +41,18 @@ pub const SYS_SBRK: u64 = 36;
 pub const SYS_LSEEK: u64 = 37;
 pub const SYS_FSTAT: u64 = 38;
 pub const SYS_GETTIMEOFDAY: u64 = 39;
+// Process and IPC primitives added for POSIX-style shells and pipelines.
+pub const SYS_DUP: u64 = 40;
+pub const SYS_DUP2: u64 = 41;
+pub const SYS_PIPE: u64 = 42;
+pub const SYS_SPAWN: u64 = 43;
+pub const SYS_WAIT: u64 = 44;
+/// `fork(2)`: duplica o processo atual. Devolve 0 no filho, o pid no pai.
+pub const SYS_FORK: u64 = 45;
+/// `waitpid(pid, &status, flags)`: espera um filho e coleta o status.
+pub const SYS_WAITPID: u64 = 46;
+/// `execve(path, argv, envp)`: substitui a imagem do processo atual.
+pub const SYS_EXECVE: u64 = 47;
 
 pub const SIGNAL_HUP: u64 = 1;
 pub const SIGNAL_INT: u64 = 2;
@@ -54,7 +66,9 @@ pub const SIGNAL_IGNORE: u64 = 1;
 
 pub const PROCESS_RUNNING: u32 = 1;
 pub const PROCESS_STOPPED: u32 = 2;
-pub const MAX_PROCESSES: usize = 8;
+// Large enough for a shell plus a handful of pipeline stages. Each slot costs a
+// 64 KiB kernel stack (see `KERNEL_STACKS`), so this is not free memory.
+pub const MAX_PROCESSES: usize = 16;
 pub const PROCESS_NAME_SIZE: usize = 64;
 pub const ACCOUNT_NAME_SIZE: usize = 32;
 pub const ACCOUNT_PASSWORD_SIZE: usize = 64;
@@ -63,7 +77,7 @@ pub const HOSTNAME_SIZE: usize = 64;
 pub const FD_STDIN: u64 = 0;
 pub const FD_STDOUT: u64 = 1;
 pub const FD_STDERR: u64 = 2;
-pub const MAX_OPEN_FDS: usize = 16;
+pub const MAX_OPEN_FDS: usize = 24;
 
 pub const OPEN_READ: u64 = 1 << 0;
 pub const OPEN_WRITE: u64 = 1 << 1;
@@ -75,6 +89,11 @@ pub const OPEN_EXCLUSIVE: u64 = 1 << 5;
 pub const MAX_EXEC_ARGS: usize = 12;
 pub const MAX_EXEC_ENV: usize = 12;
 pub const MAX_EXEC_ITEM_SIZE: usize = 128;
+
+/// Number of pipes available system-wide (each has a read end and a write end).
+pub const MAX_PIPES: usize = 8;
+/// Capacity of each pipe ring buffer, in bytes.
+pub const PIPE_CAPACITY: usize = 4096;
 pub const MAX_CONSOLE_WRITE: usize = 512;
 pub const MAX_PATH_QUERY: usize = 128;
 pub const MAX_MUTABLE_PATH: usize = 256;
@@ -86,6 +105,57 @@ pub const MAX_WRITE_FILE_SIZE: usize = 4096;
 pub struct UserArg {
     pub address: u64,
     pub length: u64,
+}
+
+/// Describes how a child created by `SYS_SPAWN` should see its standard
+/// descriptors. Each field is a descriptor number owned by the *caller*: the
+/// kernel duplicates it into the child, so `0`, `1`, `2` keep meaning
+/// stdin/stdout/stderr. `-1` means "leave it as the default".
+///
+/// This is how a shell sets up a pipeline (`child 1 | child 2`) without a real
+/// `fork`: give the left child `stdout = pipe_write`, the right child
+/// `stdin = pipe_read`, and close the unused ends in the parent afterwards.
+/// Describes how a child created by `SYS_SPAWN` should see its standard
+/// descriptors, and carries the environment for the child.
+///
+/// The six syscall registers are all used by `SYS_SPAWN`, so the environment
+/// (pointer and count) travels inside this structure instead of taking extra
+/// registers. Both fields are `u64` so the layout is identical for the kernel
+/// and for 64-bit userspace.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpawnIo {
+    pub stdin_fd: i64,
+    pub stdout_fd: i64,
+    pub stderr_fd: i64,
+    /// Ponteiro para um array de [`UserArg`] com o ambiente do filho.
+    pub environment: u64,
+    /// Quantidade de entradas em `environment`.
+    pub environment_count: u64,
+}
+
+impl SpawnIo {
+    /// Sentinel meaning "keep the default descriptor".
+    pub const INHERIT: i64 = -1;
+}
+
+/// `Default` inherits every descriptor and passes no environment.
+///
+/// A caller that only wants to override one descriptor writes just that field:
+///
+/// ```ignore
+/// SpawnIo { stdout_fd: write_end as i64, ..SpawnIo::default() }
+/// ```
+impl Default for SpawnIo {
+    fn default() -> Self {
+        Self {
+            stdin_fd: Self::INHERIT,
+            stdout_fd: Self::INHERIT,
+            stderr_fd: Self::INHERIT,
+            environment: 0,
+            environment_count: 0,
+        }
+    }
 }
 
 #[repr(C)]

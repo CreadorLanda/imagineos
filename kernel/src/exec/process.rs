@@ -13,7 +13,13 @@ pub use imagineos_abi::UserArg;
 const MAX_PROCESSES: usize = imagineos_abi::MAX_PROCESSES;
 // The synchronous DFS installer nests large journal transaction buffers.
 const KERNEL_STACK_SIZE: usize = 64 * 1024;
-const USER_STACK_SIZE: u64 = 8 * 4096;
+// A full-featured shell keeps parsed commands, expanded words and redirection
+// buffers on the user stack at once. 32 KiB proved too tight (a page fault at
+// the top of the stack while running `echo`). After `fork`, the child inherits
+// the parent's stack at whatever depth the fork happened, and the path from
+// there to `execve` (pipe setup plus command expansion) needs room of its own.
+// 128 KiB covers that comfortably; the space is virtual until touched.
+const USER_STACK_SIZE: u64 = 32 * 4096;
 pub const USER_STACK_TOP: u64 = 0x0000_7fff_ffff_0000;
 const PAGE_SIZE: u64 = 4096;
 const USER_HEAP_START: u64 = 0x0000_0001_0000_0000;
@@ -29,6 +35,10 @@ pub enum DescriptorKind {
     Stdout,
     Stderr,
     File,
+    /// Extremidade de leitura de um pipe (ver `crate::ipc`).
+    PipeRead,
+    /// Extremidade de escrita de um pipe.
+    PipeWrite,
 }
 
 #[derive(Clone, Copy)]
@@ -41,6 +51,8 @@ pub struct Descriptor {
     pub input: [u8; 4],
     pub input_length: usize,
     pub input_offset: usize,
+    /// Id do pipe quando `kind` é `PipeRead`/`PipeWrite`.
+    pub pipe: crate::ipc::PipeId,
 }
 
 impl Descriptor {
@@ -56,7 +68,15 @@ impl Descriptor {
             input: [0; 4],
             input_length: 0,
             input_offset: 0,
+            pipe: 0,
         }
+    }
+
+    /// Cria um descritor que referencia uma extremidade de pipe.
+    pub const fn pipe(kind: DescriptorKind, pipe: crate::ipc::PipeId) -> Self {
+        let mut descriptor = Self::new(kind);
+        descriptor.pipe = pipe;
+        descriptor
     }
 
     pub fn file(path: &str, flags: u64, offset: usize) -> Self {
@@ -128,6 +148,17 @@ struct Process {
     pid: usize,
     active: bool,
     stopped: bool,
+    /// Processo que chamou `fork`/`spawn`. `0` significa "sem pai" (PID 1, que é
+    /// criado pelo kernel). Usado por `waitpid` e pela coleta após a morte.
+    parent: usize,
+    /// Processo já terminou, mas o pai ainda não leu o código de saída.
+    /// O slot e o `exit_status` ficam reservados até um `waitpid` coletar.
+    zombie: bool,
+    /// Código de saída registrado quando o processo terminou.
+    exit_status: i32,
+    /// `pid` que este processo está aguardando em `waitpid` (0 = não espera).
+    /// Usado para bloquear o pai sem consumir CPU até o filho terminar.
+    waiting_for: usize,
     allows_disk_install: bool,
     uid: u32,
     gid: u32,
@@ -150,6 +181,10 @@ impl Process {
         pid: 0,
         active: false,
         stopped: false,
+        parent: 0,
+        zombie: false,
+        exit_status: 0,
+        waiting_for: 0,
         allows_disk_install: false,
         uid: 0,
         gid: 0,
@@ -231,6 +266,34 @@ pub fn init(programs: &[(&[u8], usize)]) -> Result<(), LoadError> {
     Ok(())
 }
 
+/// Onde o `TrapFrame` inicial de um processo novo é escrito.
+///
+/// O `spawn` usa o topo da pilha de kernel do slot (ninguém mais está usando a
+///quele slot). O `execve`, ao contrário, roda no slot do próprio processo, cujo
+/// topo está ocupado pelo frame do `int 0x80` em andamento — por isso ele passa
+/// um endereço na base da pilha (ver [`execve_frame_scratch`]).
+enum FrameLocation {
+    /// Topo da pilha de kernel do slot indicado.
+    TopOfSlot(usize),
+    /// Endereço explícito, escolhido pelo chamador.
+    At(*mut TrapFrame),
+}
+
+/// Endereço, na base da pilha de kernel de `slot`, onde o `execve` monta o
+/// frame do novo programa sem sobrepor o frame de syscall ativo.
+fn execve_frame_scratch(slot: usize) -> Option<*mut TrapFrame> {
+    let stacks = unsafe { &mut *KERNEL_STACKS.0.get() };
+    let base = stacks.0[slot].as_mut_ptr() as usize;
+    // Um frame a partir da base: o stub de syscall trabalha no topo, então a
+    // base está livre. A folga de um segundo frame protege contra um aninhamento
+    // inesperado (sinal durante a syscall, por exemplo).
+    let offset = 2 * size_of::<TrapFrame>();
+    if offset >= KERNEL_STACK_SIZE {
+        return None;
+    }
+    Some((base + offset) as *mut TrapFrame)
+}
+
 fn load_elf(
     image: &[u8],
     pid: usize,
@@ -239,6 +302,26 @@ fn load_elf(
     environment: &[&[u8]],
     allows_disk_install: bool,
     name: &str,
+) -> Result<Process, LoadError> {
+    load_elf_at(
+        image,
+        pid,
+        arguments,
+        environment,
+        allows_disk_install,
+        name,
+        FrameLocation::TopOfSlot(slot),
+    )
+}
+
+fn load_elf_at(
+    image: &[u8],
+    pid: usize,
+    arguments: &[&[u8]],
+    environment: &[&[u8]],
+    allows_disk_install: bool,
+    name: &str,
+    location: FrameLocation,
 ) -> Result<Process, LoadError> {
     debug_log("elf: validating header\n");
     let elf = Elf64::parse(image).map_err(LoadError::InvalidElf)?;
@@ -293,9 +376,14 @@ fn load_elf(
         return Err(LoadError::InvalidMapping);
     }
 
-    let stacks = unsafe { &mut *KERNEL_STACKS.0.get() };
-    let kernel_stack_top = stacks.0[slot].as_mut_ptr() as u64 + KERNEL_STACK_SIZE as u64;
-    let frame = (kernel_stack_top as usize - size_of::<TrapFrame>()) as *mut TrapFrame;
+    let frame = match location {
+        FrameLocation::At(pointer) => pointer,
+        FrameLocation::TopOfSlot(slot) => {
+            let stacks = unsafe { &mut *KERNEL_STACKS.0.get() };
+            let top = stacks.0[slot].as_mut_ptr() as u64 + KERNEL_STACK_SIZE as u64;
+            (top as usize - size_of::<TrapFrame>()) as *mut TrapFrame
+        }
+    };
     unsafe {
         frame.write(TrapFrame {
             r15: 0,
@@ -335,6 +423,10 @@ fn load_elf(
         pid,
         active: true,
         stopped: false,
+        parent: 0,
+        zombie: false,
+        exit_status: 0,
+        waiting_for: 0,
         allows_disk_install,
         uid: 0,
         gid: 0,
@@ -564,7 +656,16 @@ pub fn timer_tick(frame: *mut TrapFrame) -> *mut TrapFrame {
     schedule(frame, false)
 }
 
-pub fn exit_current(frame: *mut TrapFrame) -> *mut TrapFrame {
+/// Encerra o processo atual com `status`, registrando o código para que o pai
+/// possa coletá-lo em `waitpid`.
+///
+/// O slot vira um *zumbi*: `active` continua verdadeiro e `exit_status` fica
+/// guardado até o pai chamar `waitpid`. Só então o slot é realmente liberado.
+/// Isto é o comportamento do UNIX e o que permite que `$?` funcione depois que
+/// o filho já morreu.
+pub fn exit_current(frame: *mut TrapFrame, status: i32) -> *mut TrapFrame {
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    scheduler.processes[scheduler.current].exit_status = status;
     schedule(frame, true)
 }
 
@@ -738,12 +839,38 @@ fn schedule(frame: *mut TrapFrame, exiting: bool) -> *mut TrapFrame {
         fpu::save(scheduler.processes[current].fpu_state.as_mut_ptr());
     }
     if exiting {
-        scheduler.processes[current].active = false;
+        // O processo deixa de rodar, mas o slot fica reservado como zumbi até o
+        // pai coletar o status com `waitpid`. Sem isto o código de saída se
+        // perderia (e `$?` não funcionaria).
+        scheduler.processes[current].zombie = true;
+        scheduler.processes[current].stopped = false;
+        scheduler.processes[current].waiting_for = 0;
+        // Fecha os descritores do processo que terminou. Sem isto as pontas de
+        // pipe entregues a um filho continuavam contadas para sempre, e um
+        // leitor jamais veria EOF (`cat` girava em EAGAIN indefinidamente em
+        // `ls | cat`). Também evita vazar os descritores do slot reutilizado.
+        release_descriptors(current);
+        // Um processo que esperava por este filho pode voltar a rodar.
+        let finished = scheduler.processes[current].pid;
+        for index in 0..MAX_PROCESSES {
+            if scheduler.processes[index].waiting_for == finished {
+                scheduler.processes[index].waiting_for = 0;
+            }
+        }
     }
 
     for distance in 1..=MAX_PROCESSES {
         let candidate = (current + distance) % MAX_PROCESSES;
-        if scheduler.processes[candidate].active && !scheduler.processes[candidate].stopped {
+        // Um zumbi não é escalonável (espera ser coletado), e um processo
+        // bloqueado em `waitpid` também não: se ele fosse escolhido, gastaria o
+        // seu quantum reavaliando o mesmo `waitpid`, e o filho que ele espera
+        // nunca seria escalonado no meio disso. O `waitpid` limpa `waiting_for`
+        // quando o alvo termina, então o pai volta a ser elegível nesse ponto.
+        if scheduler.processes[candidate].active
+            && !scheduler.processes[candidate].stopped
+            && !scheduler.processes[candidate].zombie
+            && scheduler.processes[candidate].waiting_for == 0
+        {
             scheduler.current = candidate;
             let next = scheduler.processes[candidate];
             let address_space = next.address_space.expect("process address space");
@@ -767,6 +894,121 @@ pub fn spawn_current(
     path: &str,
     arguments: &[&[u8]],
     environment: &[&[u8]],
+    frame: *mut TrapFrame,
+) -> *mut TrapFrame {
+    // Plain `exec` keeps the default stdio: it is the historical behaviour and
+    // what init/getty rely on.
+    spawn_current_with_io(path, arguments, environment, &imagineos_abi::SpawnIo::default(), frame)
+}
+
+/// `execve(2)`: substitui a imagem do processo atual.
+///
+/// O `pid` e o slot são preservados, mas memória, pilha e frame de execução são
+/// trocados pelo programa em `path`. Os descritores **não** são modificados
+/// (o shell já instalou as pontas de pipe antes de chamar `execve`).
+///
+/// Só retorna em caso de erro: em sucesso, o `TrapFrame` volta apontando para a
+/// entrada do novo programa e o processo continua a execução do zero, agora em
+/// ring 3. Este é o par que falta para `fork` + `exec` virar um `exec` POSIX de
+/// verdade.
+pub fn execve_current(
+    path: &str,
+    arguments: &[&[u8]],
+    environment: &[&[u8]],
+    frame: *mut TrapFrame,
+) -> *mut TrapFrame {
+    if !has_access(path, 1) {
+        unsafe {
+            (*frame).rax = (-13i64) as u64;
+        }
+        return frame;
+    }
+    let Some(image) = crate::ramfs::read(path) else {
+        unsafe {
+            (*frame).rax = (-2i64) as u64;
+        }
+        return frame;
+    };
+
+    let (slot, pid, process) = {
+        let scheduler = unsafe { &*SCHEDULER.0.get() };
+        let slot = scheduler.current;
+        let process = scheduler.processes[slot];
+        (slot, process.pid, process)
+    };
+
+    // `load_elf` monta o novo `TrapFrame` no **topo** da pilha de kernel do
+    // slot. Isso colide com o frame do `int 0x80` que está ativo agora, porque
+    // o `execve` roda no mesmo slot do processo que vai ser substituído
+    // (diferente do `spawn`, que usa outro slot). Escrevemos o frame novo na
+    // **base** da pilha de kernel, longe o bastante do topo para não sobrepor
+    // o frame ativo do stub de syscall.
+    let Some(execve_frame) = execve_frame_scratch(slot) else {
+        unsafe {
+            (*frame).rax = (-12i64) as u64;
+        }
+        return frame;
+    };
+    let replacement = match load_elf_at(
+        image,
+        pid,
+        arguments,
+        environment,
+        path == "/bin/distroinstall",
+        path,
+        FrameLocation::At(execve_frame),
+    ) {
+        Ok(process) => process,
+        Err(_) => {
+            unsafe {
+                (*frame).rax = (-8i64) as u64;
+            }
+            return frame;
+        }
+    };
+
+    // Preserva identidade e credenciais; só a imagem muda.
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let mut replacement = replacement;
+    replacement.parent = process.parent;
+    replacement.uid = process.uid;
+    replacement.gid = process.gid;
+    replacement.is_admin = process.is_admin;
+    replacement.username = process.username;
+    replacement.username_length = process.username_length;
+    replacement.allows_disk_install = process.allows_disk_install;
+    replacement.signal_actions = process.signal_actions;
+    replacement.signal_restorer = process.signal_restorer;
+    let new_frame = replacement.frame;
+    let new_space = replacement.address_space.expect("execve address space");
+    scheduler.processes[slot] = replacement;
+    // Troca o espaço de endereço **agora**: o `iretq` do stub volta direto para
+    // o ponto de entrada do novo programa, sem passar pelo `schedule`. Sem
+    // esta troca a CPU continuaria no espaço antigo, onde o novo programa não
+    // está mapeado — o processo girava falhando instruções sem nunca chamar
+    // uma syscall.
+    // O frame do novo programa precisa ficar registrado no processo: se o
+    // `execve` for seguido de outro `schedule` (preempção imediata, por
+    // exemplo), o escalonador restauraria o frame antigo e o processo voltaria
+    // a executar o código anterior — do lado de fora isso parecia um `ls`
+    // girando sem nunca chamar syscall.
+    scheduler.processes[slot].frame = new_frame;
+    paging::switch(new_space);
+    let _ = pid;
+    new_frame
+}
+
+/// Creates a new process, optionally rewiring its standard descriptors.
+///
+/// `io` holds descriptor numbers owned by the caller: each is duplicated into
+/// the child (stdin/stdout/stderr respectively), so a shell can hand a pipe end
+/// to a child without a real `fork`. Fields set to
+/// [`imagineos_abi::SpawnIo::INHERIT`] keep the caller's descriptor.
+pub fn spawn_current_with_io(
+    path: &str,
+    arguments: &[&[u8]],
+    environment: &[&[u8]],
+    io: &imagineos_abi::SpawnIo,
     frame: *mut TrapFrame,
 ) -> *mut TrapFrame {
     if !has_access(path, 1) {
@@ -804,6 +1046,11 @@ pub fn spawn_current(
         (slot, pid, scheduler.current)
     };
 
+    // O pai é quem chamou o `spawn`, para que `waitpid` funcione no shell.
+    let parent_pid = {
+        let scheduler = unsafe { &*SCHEDULER.0.get() };
+        scheduler.processes[parent_slot].pid
+    };
     let process = match load_elf(
         image,
         pid,
@@ -821,12 +1068,20 @@ pub fn spawn_current(
             return frame;
         }
     };
-    unsafe {
-        let tables = &mut *DESCRIPTOR_TABLES.0.get();
-        for index in 0..MAX_OPEN_FDS {
-            tables[slot].0[index] = tables[parent_slot].0[index];
-        }
-    }
+    // O filho começa com stdio padrão e recebe as redireções pedidas em `io`.
+    //
+    // Deliberadamente *não* herdamos o resto da tabela de descritores do pai:
+    // herdar fds altos fazia cada filho segurar referências extras de pipe
+    // (uma cópia em fd alto + a instalada em stdio), e a contagem nunca chegava
+    // a zero quando o produtor terminava — daí `ls | cat` ficar preso em
+    // EAGAIN. Fechar tudo além de 0/1/2 no `spawn` é o comportamento POSIX
+    // (close-on-exec) e torna a contagem de pontas de pipe previsível.
+    let tables = unsafe { &mut *DESCRIPTOR_TABLES.0.get() };
+    // Copia a tabela do pai: `apply_spawn_io` precisa ler os descritores dela
+    // enquanto escreve na do filho, e as duas vivem no mesmo array.
+    let parent_table = tables[parent_slot];
+    tables[slot] = DescriptorTable::new();
+    apply_spawn_io(&mut tables[slot], io, &parent_table);
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     let parent = scheduler.processes[parent_slot];
     let mut process = process;
@@ -835,12 +1090,291 @@ pub fn spawn_current(
     process.is_admin = parent.is_admin;
     process.username = parent.username;
     process.username_length = parent.username_length;
+    process.parent = parent_pid;
     scheduler.processes[slot] = process;
     scheduler.count = scheduler.count.max(slot + 1);
     unsafe {
         (*frame).rax = pid as u64;
     }
     schedule(frame, false)
+}
+
+/// `fork(2)`: cria um processo que é uma cópia do atual.
+///
+/// O filho recebe:
+///
+/// * uma **cópia** do espaço de endereço (sem copy-on-write: cada página é
+///   duplicada em um frame novo);
+/// * uma cópia do `TrapFrame`, com `rax = 0` — é assim que o filho distingue-se
+///   do pai, que vê o pid do filho em `rax`;
+/// * uma cópia da tabela de descritores, com as referências de pipe contadas;
+/// * as mesmas credenciais e o registro do pai para `waitpid`.
+///
+/// Devolve o frame a retomar. O escalonador continua no pai (o filho entra na
+/// fila e rodará no próximo `yield`), então o valor de retorno é o frame do
+/// próprio pai com `rax` ajustado.
+pub fn fork_current(frame: *mut TrapFrame) -> *mut TrapFrame {
+    if frame.is_null() {
+        return frame;
+    }
+    let (slot, pid, parent_slot, parent_pid) = {
+        let scheduler = unsafe { &*SCHEDULER.0.get() };
+        let Some(slot) = scheduler.processes.iter().position(|process| !process.active) else {
+            unsafe {
+                (*frame).rax = (-11i64) as u64; // EAGAIN
+            }
+            return frame;
+        };
+        let pid = scheduler
+            .processes
+            .iter()
+            .map(|process| process.pid)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let parent = scheduler.processes[scheduler.current];
+        (slot, pid, scheduler.current, parent.pid)
+    };
+
+    let (parent_space, parent_frame) = {
+        let scheduler = unsafe { &*SCHEDULER.0.get() };
+        let parent = scheduler.processes[parent_slot];
+        (parent.address_space, unsafe { *frame })
+    };
+    let Some(parent_space) = parent_space else {
+        unsafe {
+            (*frame).rax = (-12i64) as u64; // ENOMEM
+        }
+        return frame;
+    };
+    let Some(child_space) = parent_space.clone_user() else {
+        unsafe {
+            (*frame).rax = (-12i64) as u64; // ENOMEM
+        }
+        return frame;
+    };
+
+    // O filho retoma exatamente onde o pai estava, mas com `rax = 0`.
+    let stacks = unsafe { &mut *KERNEL_STACKS.0.get() };
+    let kernel_stack_top = stacks.0[slot].as_mut_ptr() as u64 + KERNEL_STACK_SIZE as u64;
+    let child_frame = (kernel_stack_top as usize - size_of::<TrapFrame>()) as *mut TrapFrame;
+    unsafe {
+        child_frame.write(TrapFrame {
+            rax: 0,
+            ..parent_frame
+        });
+    }
+
+
+    // Cópia da tabela de descritores: cada ponta de pipe compartilhada ganha
+    // mais uma referência, exatamente como `dup` faria em cada fd.
+    let tables = unsafe { &mut *DESCRIPTOR_TABLES.0.get() };
+    let parent_table = tables[parent_slot];
+    tables[slot] = parent_table;
+    for descriptor in tables[slot].0.iter() {
+        match descriptor.kind {
+            DescriptorKind::PipeRead => {
+                let _ = crate::ipc::add_reader(descriptor.pipe);
+            }
+            DescriptorKind::PipeWrite => {
+                let _ = crate::ipc::add_writer(descriptor.pipe);
+            }
+            _ => {}
+        }
+    }
+
+    let mut fpu_state = FpuState::EMPTY;
+    unsafe {
+        fpu::reset(fpu_state.as_mut_ptr());
+    }
+
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let parent = scheduler.processes[parent_slot];
+    scheduler.processes[slot] = Process {
+        pid,
+        active: true,
+        stopped: false,
+        parent: parent_pid,
+        zombie: false,
+        exit_status: 0,
+        waiting_for: 0,
+        allows_disk_install: parent.allows_disk_install,
+        uid: parent.uid,
+        gid: parent.gid,
+        is_admin: parent.is_admin,
+        username: parent.username,
+        username_length: parent.username_length,
+        frame: child_frame,
+        address_space: Some(child_space),
+        heap_end: parent.heap_end,
+        name: parent.name,
+        pending_signals: 0,
+        signal_actions: parent.signal_actions,
+        signal_restorer: parent.signal_restorer,
+        signal_frame: None,
+        fpu_state,
+    };
+    scheduler.count = scheduler.count.max(slot + 1);
+    unsafe {
+        (*frame).rax = pid as u64;
+    }
+    frame
+}
+
+/// `waitpid(pid, &status, flags)`: espera um filho terminar e coleta o status.
+///
+/// Comportamento implementado:
+///
+/// * `pid > 0` — espera especificamente aquele filho;
+/// * `pid < 0` — espera qualquer filho;
+/// * `pid == 0` — igual a `-1` (só filhos do mesmo processo).
+///
+/// Devolve o `pid` coletado e escreve `status << 8` no ponteiro do usuário,
+/// como o POSIX (o código de saída ocupa os 8 bits altos). Enquanto o filho não
+/// termina, o kernel marca `waiting_for` e cede a CPU — sem busy-wait, o pai só
+/// volta a rodar quando o filho morre (ou por preempção normal).
+///
+/// Se não houver filhos correspondentes, devolve `-ECHILD` (`-10`).
+pub fn waitpid_current(mut frame: *mut TrapFrame, pid: i64, status_pointer: u64) -> *mut TrapFrame {
+    let (parent_pid, wanted) = {
+        let scheduler = unsafe { &*SCHEDULER.0.get() };
+        (scheduler.processes[scheduler.current].pid, pid)
+    };
+
+    // Primeiro procura um corpo já pronto (zumbi) para não bloquear sem motivo.
+    loop {
+        let (reaped, found_any) = reap_child(parent_pid, wanted, status_pointer);
+        if let Some(child_pid) = reaped {
+            unsafe {
+                (*frame).rax = child_pid as u64;
+            }
+            return frame;
+        }
+        if !found_any {
+            // Nenhum filho corresponde ao pedido.
+            unsafe {
+                (*frame).rax = (-10i64) as u64; // ECHILD
+            }
+            return frame;
+        }
+
+        // Há filho vivo: marca quem esperamos e cede a CPU. O `schedule`
+        // remove `waiting_for` quando o filho termina, e este laço é
+        // reavaliado quando o pai for escalonado de novo.
+        {
+            let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+            let current = scheduler.current;
+            // `wanted < 0` ou 0: espera qualquer filho, então sinalizamos com o
+            // próprio pai (0 como sentinela "qualquer"); o schedule limpa o
+            // campo quando qualquer filho termina.
+            scheduler.processes[current].waiting_for = if wanted > 0 {
+                wanted as usize
+            } else {
+                usize::MAX
+            };
+        }
+        frame = schedule(frame, false);
+        if frame.is_null() {
+            return frame;
+        }
+        // Depois de voltar ao pai, tenta coletar de novo.
+    }
+}
+
+/// Procura um filho de `parent_pid` (zumbi ou não) que satisfaça `wanted`.
+///
+/// Devolve `(pid_coletado, existe_algum_filho)`.
+fn reap_child(parent_pid: usize, wanted: i64, status_pointer: u64) -> (Option<usize>, bool) {
+    let mut found_any = false;
+    let mut collected: Option<(usize, i32)> = None;
+    {
+        let scheduler = unsafe { &*SCHEDULER.0.get() };
+        for process in scheduler.processes.iter() {
+            if !process.active || process.parent != parent_pid {
+                continue;
+            }
+            let matches = match wanted {
+                value if value > 0 => process.pid == value as usize,
+                // Qualquer filho (o POSIX distingue grupos de processo em
+                // `pid == 0`, que este kernel ainda não modela).
+                _ => true,
+            };
+            if !matches {
+                continue;
+            }
+            found_any = true;
+            if process.zombie && collected.is_none() {
+                collected = Some((process.pid, process.exit_status));
+            }
+        }
+    }
+
+    let Some((child_pid, exit_status)) = collected else {
+        return (None, found_any);
+    };
+
+    // Escreve o status no formato POSIX: código nos 8 bits altos.
+    let status_value = ((exit_status as u32) & 0xff) << 8;
+    if status_pointer != 0 && !copy_to_current_user(status_pointer, &status_value.to_le_bytes()) {
+        // Falha ao escrever o status (ponteiro inválido): não coleta o filho,
+        // para que o código de saída não se perca. O chamador recebe EFAULT.
+        return (None, found_any);
+    }
+
+    // Libera o slot do zumbi.
+    {
+        let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+        if let Some(slot) = scheduler
+            .processes
+            .iter()
+            .position(|process| process.active && process.pid == child_pid)
+        {
+            scheduler.processes[slot] = Process::EMPTY;
+        }
+    }
+    (Some(child_pid), found_any)
+}
+
+/// Instala em `child` (slots 0/1/2) os descritores de `parent` indicados em
+/// `io`. Um campo `INHERIT` deixa o slot no valor padrão.
+///
+/// Cada ponta de pipe instalada ganha **uma** referência na contagem, que é
+/// liberada quando o processo termina ou fecha o descritor.
+fn apply_spawn_io(
+    child: &mut DescriptorTable,
+    io: &imagineos_abi::SpawnIo,
+    parent: &DescriptorTable,
+) {
+    let slots = [
+        (0usize, io.stdin_fd),
+        (1usize, io.stdout_fd),
+        (2usize, io.stderr_fd),
+    ];
+    for (target, source) in slots {
+        if source == imagineos_abi::SpawnIo::INHERIT {
+            continue;
+        }
+        let Ok(source) = usize::try_from(source) else {
+            continue;
+        };
+        if source >= MAX_OPEN_FDS {
+            continue;
+        }
+        let descriptor = parent.0[source];
+        if descriptor.kind == DescriptorKind::Closed {
+            continue;
+        }
+        match descriptor.kind {
+            DescriptorKind::PipeRead => {
+                let _ = crate::ipc::add_reader(descriptor.pipe);
+            }
+            DescriptorKind::PipeWrite => {
+                let _ = crate::ipc::add_writer(descriptor.pipe);
+            }
+            _ => {}
+        }
+        child.0[target] = descriptor;
+    }
 }
 
 fn has_access(path: &str, requested: u16) -> bool {
@@ -1057,6 +1591,15 @@ pub fn update_descriptor(fd: usize, descriptor: Descriptor) -> bool {
     true
 }
 
+/// Fecha todos os descritores de um slot e libera as referências de pipe.
+fn release_descriptors(slot: usize) {
+    let tables = unsafe { &mut *DESCRIPTOR_TABLES.0.get() };
+    for descriptor in tables[slot].0.iter_mut() {
+        release_pipe_reference(descriptor);
+        *descriptor = Descriptor::CLOSED;
+    }
+}
+
 pub fn close_descriptor(fd: usize) -> bool {
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     let Some(slot) = (unsafe { &mut *DESCRIPTOR_TABLES.0.get() })[scheduler.current]
@@ -1065,11 +1608,94 @@ pub fn close_descriptor(fd: usize) -> bool {
     else {
         return false;
     };
-    if slot.kind == DescriptorKind::Closed {
+    let descriptor = *slot;
+    if descriptor.kind == DescriptorKind::Closed {
         return false;
     }
+    // Release the pipe reference before dropping the descriptor, otherwise the
+    // end count would leak and a pipeline stage would never see EOF.
+    release_pipe_reference(&descriptor);
     *slot = Descriptor::CLOSED;
     true
+}
+
+/// Adjusts the reader/writer counts of a pipe when a descriptor that points at
+/// it disappears from a table.
+fn release_pipe_reference(descriptor: &Descriptor) {
+    match descriptor.kind {
+        DescriptorKind::PipeRead => crate::ipc::close_reader(descriptor.pipe),
+        DescriptorKind::PipeWrite => crate::ipc::close_writer(descriptor.pipe),
+        _ => {}
+    }
+}
+
+/// `dup`: devolve um novo descritor que referencia o mesmo objeto do `fd`.
+///
+/// Para pipes isso incrementa a contagem da ponta, exatamente como `dup(2)`.
+pub fn duplicate_descriptor(fd: usize) -> Result<usize, i64> {
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    let Some(descriptor) = (unsafe { &*DESCRIPTOR_TABLES.0.get() })[scheduler.current]
+        .0
+        .get(fd)
+        .copied()
+    else {
+        return Err(-9);
+    };
+    if descriptor.kind == DescriptorKind::Closed {
+        return Err(-9);
+    }
+    match descriptor.kind {
+        DescriptorKind::PipeRead => {
+            crate::ipc::add_reader(descriptor.pipe).map_err(|error| error.to_errno())?
+        }
+        DescriptorKind::PipeWrite => {
+            crate::ipc::add_writer(descriptor.pipe).map_err(|error| error.to_errno())?
+        }
+        _ => {}
+    }
+    allocate_descriptor(descriptor).ok_or_else(|| {
+        release_pipe_reference(&descriptor);
+        -24 // EMFILE
+    })
+}
+
+/// `dup2`: faz `target` referenciar o mesmo objeto de `source`, fechando o que
+/// houvesse em `target`. É a peça que o shell usa para instalar as pontas de um
+/// pipe em `stdin`/`stdout`.
+pub fn duplicate_descriptor_to(source: usize, target: usize) -> Result<usize, i64> {
+    if target as u64 >= MAX_OPEN_FDS as u64 {
+        return Err(-9);
+    }
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    let Some(descriptor) = (unsafe { &*DESCRIPTOR_TABLES.0.get() })[scheduler.current]
+        .0
+        .get(source)
+        .copied()
+    else {
+        return Err(-9);
+    };
+    if descriptor.kind == DescriptorKind::Closed {
+        return Err(-9);
+    }
+    if source == target {
+        return Ok(target);
+    }
+    // Take the extra pipe reference first: if the table entry cannot be
+    // replaced we must not have changed any counts.
+    match descriptor.kind {
+        DescriptorKind::PipeRead => {
+            crate::ipc::add_reader(descriptor.pipe).map_err(|error| error.to_errno())?
+        }
+        DescriptorKind::PipeWrite => {
+            crate::ipc::add_writer(descriptor.pipe).map_err(|error| error.to_errno())?
+        }
+        _ => {}
+    }
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    let slot = &mut (unsafe { &mut *DESCRIPTOR_TABLES.0.get() })[scheduler.current].0[target];
+    release_pipe_reference(slot);
+    *slot = descriptor;
+    Ok(target)
 }
 
 pub fn with_current_space<T>(operation: impl FnOnce(AddressSpace) -> T) -> T {

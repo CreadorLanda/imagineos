@@ -46,6 +46,20 @@ $(BUILD_DIR)/user/sbin/%: $(ROOT)/userland/apps/%.rs $(ROOT)/userland/linker.ld 
 		-C panic=abort -C relocation-model=static \
 		-C link-arg=-T$(ROOT)/userland/linker.ld $< -o $@
 
+# O shell é um binário multi-módulo (`userland/apps/shell/`), então tem regra
+# própria: o padrão `%.rs` não cobre `main.rs` mais os módulos irmãos.
+SHELL_SOURCES := $(wildcard $(ROOT)/userland/apps/shell/*.rs)
+
+$(BUILD_DIR)/user/bin/shell: $(filter-out %/tests.rs,$(SHELL_SOURCES)) $(ROOT)/userland/linker.ld \
+                             $(USER_API_RLIB) $(USER_RUNTIME_RLIB)
+	@mkdir -p $(dir $@)
+	$(RUSTC) --crate-name shell --edition 2021 --target $(TARGET) \
+		--extern imagineos=$(USER_API_RLIB) --extern imagineos_rt=$(USER_RUNTIME_RLIB) \
+		-L dependency=$(USER_API_DEPS) -L dependency=$(USER_RUNTIME_DEPS) \
+		-C panic=abort -C relocation-model=static \
+		-C link-arg=-T$(ROOT)/userland/linker.ld \
+		$(ROOT)/userland/apps/shell/main.rs -o $@
+
 $(BUILD_DIR)/user/bin/%: $(ROOT)/userland/apps/%.rs $(ROOT)/userland/linker.ld \
                          $(USER_API_RLIB) $(USER_RUNTIME_RLIB)
 	@mkdir -p $(dir $@)

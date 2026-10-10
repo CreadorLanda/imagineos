@@ -76,7 +76,7 @@ FONT_ASSET      := $(ROOT)/tools/assets/zap-vga16.psf
 # ==============================================================================
 
 RAMFS_ROOT     := $(ROOT)/ramfs
-RAMFS_DIRS     := bin dev sbin home system/fonts system/install tmp usr
+RAMFS_DIRS     := bin dev etc sbin home system/fonts system/install tmp usr
 USER_UTILITIES := cat dmesg distroinstall fdtest globalconf grep kill ls mkdir ps rm shutdown su sudo touch uname vi hello
 USER_C_UTILITIES := hello_c tcc
 

@@ -14,6 +14,7 @@ use imagineos_abi::{
     SYS_ISFILE, SYS_MKDIR, SYS_OPEN, SYS_POWER_OFF, SYS_READ, SYS_READDIR, SYS_READ_FD,
     SYS_READ_FILE, SYS_REMOVE, SYS_SHUTDOWN_POLL, SYS_SHUTDOWN_REQUEST, SYS_TOUCH, SYS_WRITE,
     SYS_FSTAT, SYS_GETTIMEOFDAY, SYS_SBRK, SYS_LSEEK, SYS_WRITE_FD, SYS_WRITE_FILE, SYS_YIELD,
+    SYS_DUP, SYS_DUP2, SYS_PIPE, SYS_SPAWN, SYS_FORK, SYS_WAITPID, SYS_EXECVE,
 };
 
 struct SharedKeyboard(UnsafeCell<Keyboard>);
@@ -70,7 +71,11 @@ fn syscall_dispatch_inner(frame: *mut TrapFrame) -> *mut TrapFrame {
             frame_ref.rax = 0;
             process::yield_current(frame)
         }
-        SYS_EXIT => process::exit_current(frame),
+        SYS_EXIT => {
+            // `rdi` traz o status de saída, como `exit(status)` no POSIX.
+            // O pai o recebe em `waitpid` e em `$?`.
+            process::exit_current(frame, frame_ref.rdi as i32)
+        }
         SYS_GETPID => {
             frame_ref.rax = process::current_pid() as u64;
             frame
@@ -288,123 +293,29 @@ fn syscall_dispatch_inner(frame: *mut TrapFrame) -> *mut TrapFrame {
             frame_ref.rax = 0;
             frame
         }
-        SYS_EXEC => {
-            let length = frame_ref.rsi as usize;
-            if length == 0 || length > imagineos_abi::MAX_EXEC_ITEM_SIZE {
-                frame_ref.rax = (-22i64) as u64;
-                return frame;
-            }
-            let mut path = [0u8; 128];
-            if !process::copy_from_current_user(frame_ref.rdi, &mut path[..length]) {
-                frame_ref.rax = (-14i64) as u64;
-                return frame;
-            }
-            if path[..length].contains(&0) {
-                frame_ref.rax = (-22i64) as u64;
-                return frame;
-            }
-            let Ok(path) = core::str::from_utf8(&path[..length]) else {
-                frame_ref.rax = (-22i64) as u64;
-                return frame;
-            };
-            let argument_count = frame_ref.r10 as usize;
-            if argument_count > process::MAX_EXEC_ARGS {
-                frame_ref.rax = (-7i64) as u64;
-                return frame;
-            }
-            let mut user_arguments = [UserArg::EMPTY; process::MAX_EXEC_ARGS];
-            let metadata_length = argument_count * core::mem::size_of::<UserArg>();
-            let metadata = unsafe {
-                core::slice::from_raw_parts_mut(
-                    user_arguments.as_mut_ptr().cast::<u8>(),
-                    metadata_length,
-                )
-            };
-            if !process::copy_from_current_user(frame_ref.rdx, metadata) {
-                frame_ref.rax = (-14i64) as u64;
-                return frame;
-            }
-
-            let mut argument_storage = [[0u8; 128]; process::MAX_EXEC_ARGS];
-            let mut argument_lengths = [0usize; process::MAX_EXEC_ARGS];
-            for index in 0..argument_count {
-                let Ok(length) = usize::try_from(user_arguments[index].length) else {
-                    frame_ref.rax = (-7i64) as u64;
-                    return frame;
-                };
-                if length > argument_storage[index].len() {
-                    frame_ref.rax = (-7i64) as u64;
+        SYS_EXEC | SYS_EXECVE => {
+            // `exec` cria outro processo (histórico); `execve` substitui a imagem
+            // do processo atual, completando o par `fork` + `exec` do POSIX.
+            let replace = frame_ref.rax == SYS_EXECVE;
+            let mut decoded = ExecArguments::new();
+            match decoded.load(frame_ref) {
+                Ok(()) => {}
+                Err(error) => {
+                    frame_ref.rax = error as u64;
                     return frame;
                 }
-                if !process::copy_from_current_user(
-                    user_arguments[index].address,
-                    &mut argument_storage[index][..length],
-                ) {
-                    frame_ref.rax = (-14i64) as u64;
-                    return frame;
-                }
-                if argument_storage[index][..length].contains(&0) {
-                    frame_ref.rax = (-22i64) as u64;
-                    return frame;
-                }
-                argument_lengths[index] = length;
             }
-            let mut arguments: [&[u8]; process::MAX_EXEC_ARGS] = [&[]; process::MAX_EXEC_ARGS];
-            for index in 0..argument_count {
-                arguments[index] = &argument_storage[index][..argument_lengths[index]];
+            // As fatias devolvidas têm o tamanho máximo do vetor; usar o vetor
+            // inteiro faria `argc` chegar como `MAX_EXEC_ARGS` ao processo.
+            let arguments = decoded.arguments();
+            let arguments = &arguments[..decoded.argument_count()];
+            let environment = decoded.environment();
+            let environment = &environment[..decoded.environment_count()];
+            if replace {
+                process::execve_current(decoded.path(), arguments, environment, frame)
+            } else {
+                process::spawn_current(decoded.path(), arguments, environment, frame)
             }
-
-            let environment_count = frame_ref.r9 as usize;
-            if environment_count > process::MAX_EXEC_ENV {
-                frame_ref.rax = (-7i64) as u64;
-                return frame;
-            }
-            let mut user_environment = [UserArg::EMPTY; process::MAX_EXEC_ENV];
-            let metadata_length = environment_count * core::mem::size_of::<UserArg>();
-            let metadata = unsafe {
-                core::slice::from_raw_parts_mut(
-                    user_environment.as_mut_ptr().cast::<u8>(),
-                    metadata_length,
-                )
-            };
-            if !process::copy_from_current_user(frame_ref.r8, metadata) {
-                frame_ref.rax = (-14i64) as u64;
-                return frame;
-            }
-            let mut environment_storage = [[0u8; 128]; process::MAX_EXEC_ENV];
-            let mut environment_lengths = [0usize; process::MAX_EXEC_ENV];
-            for index in 0..environment_count {
-                let Ok(length) = usize::try_from(user_environment[index].length) else {
-                    frame_ref.rax = (-7i64) as u64;
-                    return frame;
-                };
-                if length > environment_storage[index].len() {
-                    frame_ref.rax = (-7i64) as u64;
-                    return frame;
-                }
-                if !process::copy_from_current_user(
-                    user_environment[index].address,
-                    &mut environment_storage[index][..length],
-                ) {
-                    frame_ref.rax = (-14i64) as u64;
-                    return frame;
-                }
-                if environment_storage[index][..length].contains(&0) {
-                    frame_ref.rax = (-22i64) as u64;
-                    return frame;
-                }
-                environment_lengths[index] = length;
-            }
-            let mut environment: [&[u8]; process::MAX_EXEC_ENV] = [&[]; process::MAX_EXEC_ENV];
-            for index in 0..environment_count {
-                environment[index] = &environment_storage[index][..environment_lengths[index]];
-            }
-            process::spawn_current(
-                path,
-                &arguments[..argument_count],
-                &environment[..environment_count],
-                frame,
-            )
         }
         SYS_ISDIR => {
             let length = frame_ref.rsi as usize;
@@ -621,6 +532,23 @@ fn syscall_dispatch_inner(frame: *mut TrapFrame) -> *mut TrapFrame {
         SYS_OPEN => open_file(frame_ref),
         SYS_READ_FD => read_fd(frame_ref),
         SYS_WRITE_FD => write_fd(frame_ref),
+        SYS_DUP => {
+            frame_ref.rax = process::duplicate_descriptor(frame_ref.rdi as usize)
+                .map_or_else(|error| error as u64, |fd| fd as u64);
+            frame
+        }
+        SYS_DUP2 => {
+            frame_ref.rax = process::duplicate_descriptor_to(
+                frame_ref.rdi as usize,
+                frame_ref.rsi as usize,
+            )
+            .map_or_else(|error| error as u64, |fd| fd as u64);
+            frame
+        }
+        SYS_PIPE => create_pipe(frame_ref),
+        SYS_SPAWN => spawn_with_io(frame_ref),
+        SYS_FORK => process::fork_current(frame),
+        SYS_WAITPID => process::waitpid_current(frame, frame_ref.rdi as i64, frame_ref.rsi),
         SYS_CLOSE => {
             let Ok(fd) = usize::try_from(frame_ref.rdi) else {
                 frame_ref.rax = (-9i64) as u64;
@@ -869,6 +797,354 @@ fn mode_allows(metadata: crate::dfs::Metadata, uid: u32, gid: u32, requested: u1
     )
 }
 
+/// `pipe(int fds[2])`: cria um pipe e escreve os dois descritores no array do
+/// usuário, com o lado de leitura primeiro (posições 0 e 1), como no POSIX.
+fn create_pipe(frame: &mut TrapFrame) -> *mut TrapFrame {
+    let id = match crate::ipc::create() {
+        Ok(id) => id,
+        Err(error) => {
+            frame.rax = error.to_errno() as u64;
+            return frame;
+        }
+    };
+    let read_end = process::allocate_descriptor(process::Descriptor::pipe(
+        process::DescriptorKind::PipeRead,
+        id,
+    ));
+    let write_end = process::allocate_descriptor(process::Descriptor::pipe(
+        process::DescriptorKind::PipeWrite,
+        id,
+    ));
+    let (Some(read_end), Some(write_end)) = (read_end, write_end) else {
+        // Roll back whatever was allocated so the pipe does not leak.
+        if let Some(fd) = read_end {
+            process::close_descriptor(fd);
+        }
+        if let Some(fd) = write_end {
+            process::close_descriptor(fd);
+        }
+        crate::ipc::close_reader(id);
+        crate::ipc::close_writer(id);
+        frame.rax = (-24i64) as u64; // EMFILE
+        return frame;
+    };
+    let mut endpoints = [read_end as i32, write_end as i32];
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            endpoints.as_mut_ptr().cast::<u8>(),
+            core::mem::size_of_val(&endpoints),
+        )
+    };
+    if !process::copy_to_current_user(frame.rdi, bytes) {
+        process::close_descriptor(read_end);
+        process::close_descriptor(write_end);
+        frame.rax = (-14i64) as u64;
+        return frame;
+    }
+    frame.rax = 0;
+    frame
+}
+
+/// `spawn(path, argv, envp, io)`: como `exec`, mas o filho recebe descritores
+/// padrão escolhidos pelo chamador. É a primitiva que o shell usa para montar
+/// um estágio de pipeline sem `fork`.
+fn spawn_with_io(frame: &mut TrapFrame) -> *mut TrapFrame {
+    let length = frame.rsi as usize;
+    if length == 0 || length > imagineos_abi::MAX_EXEC_ITEM_SIZE {
+        frame.rax = (-22i64) as u64;
+        return frame;
+    }
+    let mut path = [0u8; 128];
+    if !process::copy_from_current_user(frame.rdi, &mut path[..length]) {
+        frame.rax = (-14i64) as u64;
+        return frame;
+    }
+    if path[..length].contains(&0) {
+        frame.rax = (-22i64) as u64;
+        return frame;
+    }
+    let Ok(path) = core::str::from_utf8(&path[..length]) else {
+        frame.rax = (-22i64) as u64;
+        return frame;
+    };
+    // Layout dos argumentos de `SYS_SPAWN` na ABI (ver `userland/api`):
+    //
+    //   rdi = ponteiro do caminho      rsi = comprimento do caminho
+    //   rdx = ponteiro dos argumentos  r10 = quantidade de argumentos
+    //   r8  = ponteiro de `SpawnIo`    r9  = ponteiro do ambiente
+    //
+    // Atenção: o 4º argumento chega em `r10`, não em `rcx` — `rcx` é usado
+    // pela instrução `int 0x80` para o endereço de retorno, por isso a ABI
+    // desvia esse parâmetro. Ler `rcx` aqui fazia a cópia do array de
+    // argumentos falhar e todo comando externo terminava em "falha ao
+    // executar o comando".
+    let mut io = imagineos_abi::SpawnIo::default();
+    let io_bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            (&mut io as *mut imagineos_abi::SpawnIo).cast::<u8>(),
+            core::mem::size_of::<imagineos_abi::SpawnIo>(),
+        )
+    };
+    let io_pointer = frame.r8;
+    if io_pointer != 0 && !process::copy_from_current_user(io_pointer, io_bytes) {
+        frame.rax = (-14i64) as u64;
+        return frame;
+    }
+    // O ambiente vem dentro de `SpawnIo`: os seis registradores já estão
+    // ocupados (path, len, argv, argc, io, —). `r9` não é usado.
+    let environment_pointer = io.environment;
+    let environment_count = io.environment_count as usize;
+    let argument_count = frame.r10 as usize;
+    if argument_count > process::MAX_EXEC_ARGS {
+        frame.rax = (-7i64) as u64;
+        return frame;
+    }
+    let mut user_arguments = [process::UserArg::EMPTY; process::MAX_EXEC_ARGS];
+    let metadata = unsafe {
+        core::slice::from_raw_parts_mut(
+            user_arguments.as_mut_ptr().cast::<u8>(),
+            argument_count * core::mem::size_of::<process::UserArg>(),
+        )
+    };
+    if argument_count != 0 && !process::copy_from_current_user(frame.rdx, metadata) {
+        frame.rax = (-14i64) as u64;
+        return frame;
+    }
+    let mut argument_storage = [[0u8; 128]; process::MAX_EXEC_ARGS];
+    let mut argument_lengths = [0usize; process::MAX_EXEC_ARGS];
+    for index in 0..argument_count {
+        let Ok(item_length) = usize::try_from(user_arguments[index].length) else {
+            frame.rax = (-7i64) as u64;
+            return frame;
+        };
+        if item_length > argument_storage[index].len() {
+            frame.rax = (-7i64) as u64;
+            return frame;
+        }
+        if !process::copy_from_current_user(
+            user_arguments[index].address,
+            &mut argument_storage[index][..item_length],
+        ) {
+            frame.rax = (-14i64) as u64;
+            return frame;
+        }
+        if argument_storage[index][..item_length].contains(&0) {
+            frame.rax = (-22i64) as u64;
+            return frame;
+        }
+        argument_lengths[index] = item_length;
+    }
+    let mut arguments: [&[u8]; process::MAX_EXEC_ARGS] = [&[]; process::MAX_EXEC_ARGS];
+    for index in 0..argument_count {
+        arguments[index] = &argument_storage[index][..argument_lengths[index]];
+    }
+
+    // Ambiente: mesma codificação de `UserArg` usada pelos argumentos.
+    if environment_count > process::MAX_EXEC_ENV {
+        frame.rax = (-7i64) as u64;
+        return frame;
+    }
+    let mut user_environment = [process::UserArg::EMPTY; process::MAX_EXEC_ENV];
+    let environment_metadata = unsafe {
+        core::slice::from_raw_parts_mut(
+            user_environment.as_mut_ptr().cast::<u8>(),
+            environment_count * core::mem::size_of::<process::UserArg>(),
+        )
+    };
+    if environment_count != 0
+        && !process::copy_from_current_user(environment_pointer, environment_metadata)
+    {
+        frame.rax = (-14i64) as u64;
+        return frame;
+    }
+    let mut environment_storage = [[0u8; 128]; process::MAX_EXEC_ENV];
+    let mut environment_lengths = [0usize; process::MAX_EXEC_ENV];
+    for index in 0..environment_count {
+        let Ok(item_length) = usize::try_from(user_environment[index].length) else {
+            frame.rax = (-7i64) as u64;
+            return frame;
+        };
+        if item_length > environment_storage[index].len() {
+            frame.rax = (-7i64) as u64;
+            return frame;
+        }
+        if !process::copy_from_current_user(
+            user_environment[index].address,
+            &mut environment_storage[index][..item_length],
+        ) {
+            frame.rax = (-14i64) as u64;
+            return frame;
+        }
+        if environment_storage[index][..item_length].contains(&0) {
+            frame.rax = (-22i64) as u64;
+            return frame;
+        }
+        environment_lengths[index] = item_length;
+    }
+    let mut environment: [&[u8]; process::MAX_EXEC_ENV] = [&[]; process::MAX_EXEC_ENV];
+    for index in 0..environment_count {
+        environment[index] = &environment_storage[index][..environment_lengths[index]];
+    }
+
+    process::spawn_current_with_io(
+        path,
+        &arguments[..argument_count],
+        &environment[..environment_count],
+        &io,
+        frame,
+    )
+}
+
+/// Lê um vetor de `UserArg` e copia cada item para armazenamento próprio.
+///
+/// Vale tanto para `argv` quanto para `envp`, que têm a mesma codificação.
+/// `records` é dimensionado pelo maior vetor possível; `count` limita o uso.
+fn load_vector(
+    pointer: u64,
+    count: usize,
+    limit: usize,
+    storage: &mut [[u8; 128]],
+    lengths: &mut [usize],
+) -> Result<usize, i64> {
+    if count > limit || count > storage.len() || count > lengths.len() {
+        return Err(-7);
+    }
+    if count == 0 {
+        return Ok(0);
+    }
+    let mut records = [UserArg::EMPTY; process::MAX_EXEC_ARGS];
+    let metadata = unsafe {
+        core::slice::from_raw_parts_mut(
+            records.as_mut_ptr().cast::<u8>(),
+            count * core::mem::size_of::<UserArg>(),
+        )
+    };
+    if !process::copy_from_current_user(pointer, metadata) {
+        return Err(-14);
+    }
+    for index in 0..count {
+        let Ok(length) = usize::try_from(records[index].length) else {
+            return Err(-7);
+        };
+        if length > storage[index].len() {
+            return Err(-7);
+        }
+        if !process::copy_from_current_user(
+            records[index].address,
+            &mut storage[index][..length],
+        ) {
+            return Err(-14);
+        }
+        if storage[index][..length].contains(&0) {
+            return Err(-22);
+        }
+        lengths[index] = length;
+    }
+    Ok(count)
+}
+
+/// Decodifica os argumentos comuns a `SYS_EXEC` e `SYS_EXECVE`.
+///
+/// Layout esperado no `TrapFrame` (igual ao de `execve(2)`):
+/// `rdi = path`, `rsi = path_len`, `rdx = argv`, `r10 = argc`,
+/// `r8 = envp`, `r9 = envc`.
+///
+/// Os buffers vivem na estrutura para que os empréstimos `&[u8]` devolvidos
+/// por [`arguments`](Self::arguments) sejam válidos enquanto o chamador os usa.
+struct ExecArguments {
+    path: [u8; 128],
+    path_length: usize,
+    argument_storage: [[u8; 128]; process::MAX_EXEC_ARGS],
+    argument_lengths: [usize; process::MAX_EXEC_ARGS],
+    argument_count: usize,
+    environment_storage: [[u8; 128]; process::MAX_EXEC_ENV],
+    environment_lengths: [usize; process::MAX_EXEC_ENV],
+    environment_count: usize,
+}
+
+impl ExecArguments {
+    const fn new() -> Self {
+        Self {
+            path: [0; 128],
+            path_length: 0,
+            argument_storage: [[0; 128]; process::MAX_EXEC_ARGS],
+            argument_lengths: [0; process::MAX_EXEC_ARGS],
+            argument_count: 0,
+            environment_storage: [[0; 128]; process::MAX_EXEC_ENV],
+            environment_lengths: [0; process::MAX_EXEC_ENV],
+            environment_count: 0,
+        }
+    }
+
+    fn load(&mut self, frame: &TrapFrame) -> Result<(), i64> {
+        self.load_path(frame.rdi, frame.rsi)?;
+        // `load_vector` é função livre para não conflitar com o empréstimo dos
+        // campos de `self` que ela própria preenche.
+        let argument_count = load_vector(
+            frame.rdx,
+            frame.r10 as usize,
+            process::MAX_EXEC_ARGS,
+            &mut self.argument_storage,
+            &mut self.argument_lengths,
+        )?;
+        let environment_count = load_vector(
+            frame.r8,
+            frame.r9 as usize,
+            process::MAX_EXEC_ENV,
+            &mut self.environment_storage,
+            &mut self.environment_lengths,
+        )?;
+        self.argument_count = argument_count;
+        self.environment_count = environment_count;
+        Ok(())
+    }
+
+    fn load_path(&mut self, pointer: u64, length: u64) -> Result<(), i64> {
+        let length = usize::try_from(length).map_err(|_| -22i64)?;
+        if length == 0 || length > imagineos_abi::MAX_EXEC_ITEM_SIZE || length > self.path.len() {
+            return Err(-22);
+        }
+        if !process::copy_from_current_user(pointer, &mut self.path[..length]) {
+            return Err(-14);
+        }
+        if self.path[..length].contains(&0) {
+            return Err(-22);
+        }
+        self.path_length = length;
+        Ok(())
+    }
+
+    fn path(&self) -> &str {
+        // A codificação foi validada no `load_path`.
+        core::str::from_utf8(&self.path[..self.path_length]).unwrap_or("")
+    }
+
+    /// Quantidade real de argumentos (o array tem o tamanho máximo).
+    fn argument_count(&self) -> usize {
+        self.argument_count
+    }
+
+    fn environment_count(&self) -> usize {
+        self.environment_count
+    }
+
+    fn arguments(&self) -> [&[u8]; process::MAX_EXEC_ARGS] {
+        let mut arguments: [&[u8]; process::MAX_EXEC_ARGS] = [&[]; process::MAX_EXEC_ARGS];
+        for index in 0..self.argument_count {
+            arguments[index] = &self.argument_storage[index][..self.argument_lengths[index]];
+        }
+        arguments
+    }
+
+    fn environment(&self) -> [&[u8]; process::MAX_EXEC_ENV] {
+        let mut environment: [&[u8]; process::MAX_EXEC_ENV] = [&[]; process::MAX_EXEC_ENV];
+        for index in 0..self.environment_count {
+            environment[index] = &self.environment_storage[index][..self.environment_lengths[index]];
+        }
+        environment
+    }
+}
+
 fn read_fd(frame: &mut TrapFrame) -> *mut TrapFrame {
     let (Ok(fd), Ok(capacity)) = (usize::try_from(frame.rdi), usize::try_from(frame.rdx)) else {
         frame.rax = (-22i64) as u64;
@@ -930,6 +1206,23 @@ fn read_fd(frame: &mut TrapFrame) -> *mut TrapFrame {
         process::DescriptorKind::File => {
             frame.rax = (-9i64) as u64;
             return frame;
+        }
+        process::DescriptorKind::PipeRead => {
+            match crate::ipc::read(descriptor.pipe, &mut buffer[..capacity]) {
+                Ok(length) => {
+                    // Keep the descriptor untouched (pipes are not seekable).
+                    if !process::copy_to_current_user(frame.rsi, &buffer[..length]) {
+                        frame.rax = (-14i64) as u64;
+                    } else {
+                        frame.rax = length as u64;
+                    }
+                    return frame;
+                }
+                Err(error) => {
+                    frame.rax = error.to_errno() as u64;
+                    return frame;
+                }
+            }
         }
         _ => {
             frame.rax = (-9i64) as u64;
@@ -1091,6 +1384,10 @@ fn write_fd(frame: &mut TrapFrame) -> *mut TrapFrame {
             crate::console_write_bytes(&buffer[..length]);
             frame.rax = length as u64;
         }
+        process::DescriptorKind::PipeWrite => match crate::ipc::write(descriptor.pipe, &buffer[..length]) {
+            Ok(written) => frame.rax = written as u64,
+            Err(error) => frame.rax = error.to_errno() as u64,
+        },
         process::DescriptorKind::File if descriptor.flags & OPEN_WRITE != 0 => {
             let path = core::str::from_utf8(&descriptor.path[..descriptor.path_length])
                 .expect("descriptor path is validated on open");
@@ -1136,7 +1433,19 @@ fn read_character() -> u32 {
     framebuffer::set_cursor_visible(true);
     let mut cursor_visible = true;
     loop {
-        if let Some(character) = unsafe { (&mut *KEYBOARD.0.get()).poll_char() } {
+        // O estado do teclado (shift, dead keys, prefixo E0) é um único
+        // `Keyboard` global sem lock. Se o timer preemptivo interromper esta
+        // leitura, outro processo pode entrar em `poll_char` e embaralhar esse
+        // estado — foi assim que caracteres do login sumiram. Mantemos as
+        // interrupções desligadas durante a leitura da porta para garantir que
+        // a sequência "ler status, ler dado, atualizar estado" seja atômica.
+        let character = {
+            let interrupts_were_enabled = disable_interrupts();
+            let polled = unsafe { (&mut *KEYBOARD.0.get()).poll_char() };
+            restore_interrupts(interrupts_were_enabled);
+            polled
+        };
+        if let Some(character) = character {
             framebuffer::set_cursor_visible(false);
             if character == crate::keyboard::KEY_INTERRUPT {
                 let _ = process::send_signal(process::current_pid(), imagineos_abi::SIGNAL_INT);
@@ -1158,7 +1467,28 @@ fn read_character() -> u32 {
             framebuffer::set_cursor_visible(cursor_visible);
             last_blink = now;
         }
+        // Nada a fazer: gira. As interrupções seguem ligadas, então o timer
+        // pode preemptar; `poll_char` é atômico em relação a elas.
         core::hint::spin_loop();
+    }
+}
+
+/// Desabilita interrupções e devolve o estado anterior de `RFLAGS.IF`.
+fn disable_interrupts() -> bool {
+    let flags: u64;
+    unsafe {
+        asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags));
+        asm!("cli", options(nomem, nostack, preserves_flags));
+    }
+    flags & (1 << 9) != 0
+}
+
+/// Restaura `RFLAGS.IF` conforme o valor devolvido por [`disable_interrupts`].
+fn restore_interrupts(was_enabled: bool) {
+    if was_enabled {
+        unsafe {
+            asm!("sti", options(nomem, nostack, preserves_flags));
+        }
     }
 }
 

@@ -81,7 +81,7 @@ $(RAMFS_IMAGE): ramfs \
 	# Tar para o instalador do SO
 	tar --format=ustar --numeric-owner --owner=0 --group=0 \
 		--exclude=bin/distroinstall --exclude='system/install/*' \
-		-C $(BUILD_DIR)/ramfs -cf $(RAMFS_INST_IMG) bin dev sbin home system tmp usr
+		-C $(BUILD_DIR)/ramfs -cf $(RAMFS_INST_IMG) bin dev etc sbin home system tmp usr
 
 	# Adiciona os arquivos do instalador
 	mkdir -p $(BUILD_DIR)/ramfs/system/install
@@ -94,4 +94,4 @@ $(RAMFS_IMAGE): ramfs \
 
 	# Tar final do RAMFS
 	tar --format=ustar --numeric-owner --owner=0 --group=0 \
-		-C $(BUILD_DIR)/ramfs -cf $@ bin dev sbin home system tmp usr
+		-C $(BUILD_DIR)/ramfs -cf $@ bin dev etc sbin home system tmp usr

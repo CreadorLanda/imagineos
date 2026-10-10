@@ -23,9 +23,17 @@ extern "C" fn _start(
     envc: usize,
     envp: *const *const u8,
 ) -> ! {
+    // Sem arquivos, `cat` copia o stdin para o stdout, como no POSIX. Isto é o
+    // que faz `algo | cat` funcionar.
     if argc < 2 {
-        common::write(b"usage: cat FILE...\n");
-        common::exit(2);
+        let mut buffer = [0u8; 4096];
+        let count = common::read_stdin(&mut buffer);
+        if count < 0 {
+            common::write(b"cat: cannot read stdin\n");
+            common::exit(1);
+        }
+        common::write(&buffer[..count as usize]);
+        common::exit(0);
     }
     // Each file is read once, so output is limited to the 4 KiB buffer.
     let mut buffer = [0u8; 4096];

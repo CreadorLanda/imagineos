@@ -84,6 +84,37 @@ pub fn remove(path: &[u8], recursive: bool) -> i64 {
     fs::remove(path, recursive).map_or_else(|error| -(error.code() as i64), |_| 0)
 }
 
+/// Lê de um descritor até ele chegar ao fim ou o buffer encher.
+///
+/// Devolve quantos bytes foram lidos, ou um código negativo de erro. Para um
+/// pipeline (`cmd | filtro`), o `fd` é uma ponta de pipe: `read` devolve 0 ao
+/// ver EOF e `EAGAIN` (`-11`) enquanto o produtor ainda não escreveu. Aqui
+/// `EAGAIN` é tratado cedendo a CPU e tentando de novo, para que o filtro
+/// funcione igual a um programa POSIX mesmo sem bloqueio real no kernel.
+pub fn read_fd(fd: usize, output: &mut [u8]) -> i64 {
+    let mut total = 0usize;
+    while total < output.len() {
+        match fs::read(fd, &mut output[total..]) {
+            Ok(0) => break,
+            Ok(count) => total += count,
+            Err(error) if error.code() == 11 => {
+                // EAGAIN: o escritor ainda não produziu. Cede e tenta de novo.
+                if process::yield_now().is_err() {
+                    break;
+                }
+            }
+            Err(_) if total != 0 => break,
+            Err(error) => return -(error.code() as i64),
+        }
+    }
+    total as i64
+}
+
+/// Lê todo o stdin do processo, útil para filtros de pipeline.
+pub fn read_stdin(output: &mut [u8]) -> i64 {
+    read_fd(fs::stdin(), output)
+}
+
 pub fn exit(status: u64) -> ! {
     process::exit(status as i32)
 }
