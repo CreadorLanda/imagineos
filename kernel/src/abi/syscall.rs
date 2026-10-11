@@ -15,6 +15,9 @@ use imagineos_abi::{
     SYS_READ_FILE, SYS_REMOVE, SYS_SHUTDOWN_POLL, SYS_SHUTDOWN_REQUEST, SYS_TOUCH, SYS_WRITE,
     SYS_FSTAT, SYS_GETTIMEOFDAY, SYS_SBRK, SYS_LSEEK, SYS_WRITE_FD, SYS_WRITE_FILE, SYS_YIELD,
     SYS_DUP, SYS_DUP2, SYS_PIPE, SYS_SPAWN, SYS_FORK, SYS_WAITPID, SYS_EXECVE,
+    SYS_FB_INFO, SYS_FB_MAP, SYS_INPUT_POLL, SYS_CONSOLE_RELEASE, SYS_POINTER_POSITION,
+    SYS_SURFACE_CREATE, SYS_SURFACE_PRESENT, SYS_SURFACE_FLUSH, SYS_SURFACE_DESTROY,
+    SYS_SURFACE_POLL, SYS_SURFACE_SNAPSHOT, SYS_SURFACE_SEND_EVENT, SYS_PIVOT_ROOT, WNOHANG,
 };
 
 struct SharedKeyboard(UnsafeCell<Keyboard>);
@@ -293,6 +296,41 @@ fn syscall_dispatch_inner(frame: *mut TrapFrame) -> *mut TrapFrame {
             frame_ref.rax = 0;
             frame
         }
+        SYS_FB_INFO => framebuffer_info(frame_ref),
+        SYS_FB_MAP => {
+            let result = framebuffer_map(frame_ref);
+            // Restringe o ponteiro à área visível: o servidor de display pode
+            // mapear a tela depois de alguns movimentos do mouse já terem sido
+            // acumulados, e um cursor fora da tela seria desenhado no vazio.
+            if let Some(description) = crate::framebuffer::description() {
+                crate::input::clamp_pointer(description.width as i32, description.height as i32);
+            }
+            result
+        }
+        SYS_INPUT_POLL => input_poll(frame_ref),
+        SYS_POINTER_POSITION => {
+            // O servidor de display desenha o cursor na posição atual sem
+            // precisar rastrear cada movimento acumulado desde o último poll.
+            let (x, y) = crate::input::pointer();
+            frame_ref.rax = ((x as u32 as u64) << 32) | (y as u32 as u64);
+            frame
+        }
+        SYS_CONSOLE_RELEASE => {
+            // O servidor de display assume a tela: o console do kernel para de
+            // desenhar nela e os eventos passam a ser entregues pela fila.
+            crate::framebuffer::set_active(false);
+            crate::input::capture();
+            crate::surface::set_server();
+            frame_ref.rax = 0;
+            frame
+        }
+        SYS_SURFACE_CREATE => surface_create(frame_ref),
+        SYS_SURFACE_PRESENT => surface_present(frame_ref),
+        SYS_SURFACE_FLUSH => surface_flush(frame_ref),
+        SYS_SURFACE_DESTROY => surface_destroy(frame_ref),
+        SYS_SURFACE_POLL => surface_poll(frame_ref),
+        SYS_SURFACE_SNAPSHOT => surface_snapshot(frame_ref),
+        SYS_SURFACE_SEND_EVENT => surface_send_event(frame_ref),
         SYS_EXEC | SYS_EXECVE => {
             // `exec` cria outro processo (histórico); `execve` substitui a imagem
             // do processo atual, completando o par `fork` + `exec` do POSIX.
@@ -548,7 +586,45 @@ fn syscall_dispatch_inner(frame: *mut TrapFrame) -> *mut TrapFrame {
         SYS_PIPE => create_pipe(frame_ref),
         SYS_SPAWN => spawn_with_io(frame_ref),
         SYS_FORK => process::fork_current(frame),
-        SYS_WAITPID => process::waitpid_current(frame, frame_ref.rdi as i64, frame_ref.rsi),
+        SYS_WAITPID => process::waitpid_current(
+            frame,
+            frame_ref.rdi as i64,
+            frame_ref.rsi,
+            frame_ref.rdx as i64,
+        ),
+        SYS_PIVOT_ROOT => {
+            // pivot_root(new_root, put_old): troca a raiz global. Os caminhos
+            // vêm como bytes de usuário terminados em NUL, lidos para o kernel.
+            let mut new_root = [0u8; imagineos_abi::MAX_MUTABLE_PATH];
+            let mut put_old = [0u8; imagineos_abi::MAX_MUTABLE_PATH];
+            let read_new = process::copy_from_current_user(frame_ref.rdi, &mut new_root)
+                .then(|| {
+                    let end = new_root.iter().position(|&byte| byte == 0).unwrap_or(0);
+                    &new_root[..end]
+                });
+            let read_old = process::copy_from_current_user(frame_ref.rsi, &mut put_old).then(|| {
+                let end = put_old.iter().position(|&byte| byte == 0).unwrap_or(0);
+                &put_old[..end]
+            });
+            frame_ref.rax = match (read_new, read_old) {
+                (Some(new_root), Some(put_old)) => {
+                    match (
+                        core::str::from_utf8(new_root),
+                        core::str::from_utf8(put_old),
+                    ) {
+                        (Ok(new_root), Ok(put_old)) => {
+                            match crate::vfs::pivot_root_to(new_root, put_old) {
+                                Ok(()) => 0,
+                                Err(error) => error.to_errno() as u64,
+                            }
+                        }
+                        _ => (-22i64) as u64,
+                    }
+                }
+                _ => (-14i64) as u64, // EFAULT
+            };
+            frame
+        }
         SYS_CLOSE => {
             let Ok(fd) = usize::try_from(frame_ref.rdi) else {
                 frame_ref.rax = (-9i64) as u64;
@@ -795,6 +871,258 @@ fn mode_allows(metadata: crate::dfs::Metadata, uid: u32, gid: u32, requested: u1
         gid,
         requested,
     )
+}
+
+/// `fb_info(&FramebufferInfo)`: descreve o framebuffer ativo, sem mapeá-lo.
+///
+/// O servidor de display usa isto para conhecer dimensões e formato antes de
+/// decidir onde mapear a tela.
+fn framebuffer_info(frame: &mut TrapFrame) -> *mut TrapFrame {
+    let Some(description) = crate::framebuffer::description() else {
+        frame.rax = (-19i64) as u64; // ENODEV
+        return frame;
+    };
+    let mut info = imagineos_abi::FramebufferInfo {
+        address: 0,
+        physical_address: description.physical_address,
+        width: description.width as u32,
+        height: description.height as u32,
+        pitch: description.pitch as u32,
+        red_shift: description.red_shift,
+        green_shift: description.green_shift,
+        blue_shift: description.blue_shift,
+        reserved: 0,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            (&mut info as *mut imagineos_abi::FramebufferInfo).cast::<u8>(),
+            core::mem::size_of::<imagineos_abi::FramebufferInfo>(),
+        )
+    };
+    frame.rax = if process::copy_to_current_user(frame.rdi, bytes) {
+        0
+    } else {
+        (-14i64) as u64
+    };
+    frame
+}
+
+/// `fb_map(&FramebufferInfo)`: mapeia a memória de vídeo no processo atual e
+/// preenche `address` com o endereço virtual resultante.
+///
+/// O endereço base é escolhido pelo kernel na área alta de usuário, livre entre
+/// a pilha e o fim do espaço de usuário.
+fn framebuffer_map(frame: &mut TrapFrame) -> *mut TrapFrame {
+    const FB_BASE: u64 = 0x0000_4000_0000_0000;
+    let Some(description) = crate::framebuffer::description() else {
+        frame.rax = (-19i64) as u64; // ENODEV
+        return frame;
+    };
+    let length = description
+        .pitch
+        .saturating_mul(description.height);
+    let mapped = process::with_current_space(|space| {
+        space.map_framebuffer_range(FB_BASE, description.physical_address, length)
+    });
+    let Some(address) = mapped else {
+        frame.rax = (-12i64) as u64; // ENOMEM
+        return frame;
+    };
+
+    let mut info = imagineos_abi::FramebufferInfo {
+        address,
+        physical_address: description.physical_address,
+        width: description.width as u32,
+        height: description.height as u32,
+        pitch: description.pitch as u32,
+        red_shift: description.red_shift,
+        green_shift: description.green_shift,
+        blue_shift: description.blue_shift,
+        reserved: 0,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            (&mut info as *mut imagineos_abi::FramebufferInfo).cast::<u8>(),
+            core::mem::size_of::<imagineos_abi::FramebufferInfo>(),
+        )
+    };
+    frame.rax = if process::copy_to_current_user(frame.rdi, bytes) {
+        0
+    } else {
+        (-14i64) as u64
+    };
+    frame
+}
+
+/// `surface_create(&SurfaceInfo)`: registra uma superfície e mapeia o buffer.
+fn surface_create(frame: &mut TrapFrame) -> *mut TrapFrame {
+    let mut info = imagineos_abi::SurfaceInfo::default();
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            (&mut info as *mut imagineos_abi::SurfaceInfo).cast::<u8>(),
+            core::mem::size_of::<imagineos_abi::SurfaceInfo>(),
+        )
+    };
+    if !process::copy_from_current_user(frame.rdi, bytes) {
+        frame.rax = (-14i64) as u64; // EFAULT
+        return frame;
+    }
+    frame.rax = match crate::surface::create(&mut info) {
+        Ok(()) => {
+            let out = unsafe {
+                core::slice::from_raw_parts(
+                    (&info as *const imagineos_abi::SurfaceInfo).cast::<u8>(),
+                    core::mem::size_of::<imagineos_abi::SurfaceInfo>(),
+                )
+            };
+            if process::copy_to_current_user(frame.rdi, out) {
+                0
+            } else {
+                (-14i64) as u64
+            }
+        }
+        Err(code) => code as u64,
+    };
+    frame
+}
+
+/// `surface_present(id, shown)`: mostra/esconde a superfície.
+fn surface_present(frame: &mut TrapFrame) -> *mut TrapFrame {
+    frame.rax = match crate::surface::present(frame.rdi as u32, frame.rsi != 0) {
+        Ok(()) => 0,
+        Err(code) => code as u64,
+    };
+    frame
+}
+
+/// `surface_flush(id)`: publica o frame escrito no buffer.
+fn surface_flush(frame: &mut TrapFrame) -> *mut TrapFrame {
+    frame.rax = match crate::surface::flush(frame.rdi as u32) {
+        Ok(()) => 0,
+        Err(code) => code as u64,
+    };
+    frame
+}
+
+/// `surface_destroy(id)`: remove a superfície.
+fn surface_destroy(frame: &mut TrapFrame) -> *mut TrapFrame {
+    frame.rax = match crate::surface::destroy(frame.rdi as u32) {
+        Ok(()) => 0,
+        Err(code) => code as u64,
+    };
+    frame
+}
+
+/// `surface_poll(&SurfaceEvent)`: retira um evento do dono de superfícies.
+fn surface_poll(frame: &mut TrapFrame) -> *mut TrapFrame {
+    let Some(event) = crate::surface::pop_event() else {
+        frame.rax = 0;
+        return frame;
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&event as *const imagineos_abi::SurfaceEvent).cast::<u8>(),
+            core::mem::size_of::<imagineos_abi::SurfaceEvent>(),
+        )
+    };
+    frame.rax = if process::copy_to_current_user(frame.rdi, bytes) {
+        1
+    } else {
+        (-14i64) as u64
+    };
+    frame
+}
+
+/// `surface_snapshot(&[SurfaceSnapshot], max)`: lista as superfícies visíveis
+/// e mapeia os buffers no processo atual (o servidor de display).
+fn surface_snapshot(frame: &mut TrapFrame) -> *mut TrapFrame {
+    const MAX_OUTPUT: usize = imagineos_abi::MAX_SURFACES;
+    let capacity = (frame.rsi as usize).min(MAX_OUTPUT);
+    if frame.rdi == 0 || capacity == 0 {
+        frame.rax = (-22i64) as u64; // EINVAL
+        return frame;
+    }
+    let mut output = [imagineos_abi::SurfaceSnapshot::default(); MAX_OUTPUT];
+    let count = crate::surface::snapshot_mapped(&mut output[..capacity]);
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            output.as_ptr().cast::<u8>(),
+            count * core::mem::size_of::<imagineos_abi::SurfaceSnapshot>(),
+        )
+    };
+    frame.rax = if process::copy_to_current_user(frame.rdi, bytes) {
+        count as u64
+    } else {
+        (-14i64) as u64
+    };
+    frame
+}
+
+/// `surface_send_event(&SurfaceEvent)`: entrega um evento ao dono.
+fn surface_send_event(frame: &mut TrapFrame) -> *mut TrapFrame {
+    let mut event = imagineos_abi::SurfaceEvent::default();
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            (&mut event as *mut imagineos_abi::SurfaceEvent).cast::<u8>(),
+            core::mem::size_of::<imagineos_abi::SurfaceEvent>(),
+        )
+    };
+    if !process::copy_from_current_user(frame.rdi, bytes) {
+        frame.rax = (-14i64) as u64;
+        return frame;
+    }
+    frame.rax = if crate::surface::push_event_to_surface(event.surface, event) {
+        0
+    } else {
+        (-2i64) as u64 // ENOENT
+    };
+    frame
+}
+
+/// `input_poll(&InputEvent)`: retira um evento de entrada.
+///
+/// Devolve `1` quando um evento foi escrito, `0` quando a fila está vazia.
+/// O servidor de display chama isto em laço, cedendo a CPU entre as chamadas.
+fn input_poll(frame: &mut TrapFrame) -> *mut TrapFrame {
+    // Quando o servidor captura o console, o próprio poll alimenta a fila com
+    // teclas PS/2. Fora do modo display, quem lê é o caminho antigo `read_char`.
+    if crate::input::is_captured() {
+        for _ in 0..16 {
+            let interrupts_were_enabled = disable_interrupts();
+            let key = unsafe { (&mut *KEYBOARD.0.get()).poll_char() };
+            restore_interrupts(interrupts_were_enabled);
+            let Some(key) = key else { break };
+            crate::input::push_key(key);
+        }
+    }
+    // Aproveita a chamada para drenar o mouse: o kernel não tem IRQ para a
+    // porta auxiliar, e o servidor de display é quem decide a cadência com que
+    // consulta os eventos. `mouse::poll` acumula todos os pacotes disponíveis,
+    // e `push_pointer` coalesce o movimento, de modo que o WM sempre recebe a
+    // posição mais recente em vez de uma fila de posições antigas.
+    while let Some(report) = crate::mouse::poll() {
+        if report.delta_x != 0 || report.delta_y != 0 {
+            crate::input::push_pointer(report.delta_x, report.delta_y);
+        }
+        crate::input::push_pointer_button(1, report.left);
+        crate::input::push_pointer_button(2, report.right);
+    }
+    let Some(event) = crate::input::poll() else {
+        frame.rax = 0;
+        return frame;
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&event as *const imagineos_abi::InputEvent).cast::<u8>(),
+            core::mem::size_of::<imagineos_abi::InputEvent>(),
+        )
+    };
+    frame.rax = if process::copy_to_current_user(frame.rdi, bytes) {
+        1
+    } else {
+        (-14i64) as u64
+    };
+    frame
 }
 
 /// `pipe(int fds[2])`: cria um pipe e escreve os dois descritores no array do
@@ -1446,6 +1774,14 @@ fn read_character() -> u32 {
             polled
         };
         if let Some(character) = character {
+            // Com o servidor de display no comando, o caractere vai para a fila
+            // de eventos dele em vez de ser entregue à linha de comando do
+            // kernel. Assim o terminal de texto e o display não disputam a
+            // mesma tecla.
+            if crate::input::is_captured() {
+                crate::input::push_key(character);
+                continue;
+            }
             framebuffer::set_cursor_visible(false);
             if character == crate::keyboard::KEY_INTERRUPT {
                 let _ = process::send_signal(process::current_pid(), imagineos_abi::SIGNAL_INT);

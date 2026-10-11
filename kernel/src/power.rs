@@ -83,6 +83,11 @@ pub fn power_off() -> Result<(), BlockError> {
     if crate::ata::is_ready() {
         crate::ata::PrimaryMaster.flush()?;
     }
+    // Devolve a entrada e a tela ao console do kernel: se o desligamento
+    // falhar, a sessão de texto volta a funcionar em vez de ficar muda porque o
+    // servidor de display levou os eventos consigo.
+    crate::input::release();
+    crate::framebuffer::set_active(true);
 
     let Some(registers) = (unsafe { *ACPI_POWER.0.get() }) else {
         return Err(BlockError::NotReady);

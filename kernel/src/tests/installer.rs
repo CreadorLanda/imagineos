@@ -175,7 +175,7 @@ fn installs_a_gpt_esp_and_boot_payload() {
     assert_eq!(boot_directory[128 + 11], 0x0f);
     assert_eq!(&boot_directory[160..171], b"DZIMAGE    ");
     assert_eq!(boot_directory[192 + 11], 0x0f);
-    assert_eq!(&boot_directory[224..235], b"RAMFS   TAR");
+    assert_eq!(&boot_directory[224..235], b"INITRAM IMG");
 
     let mut protective_mbr = [0; SECTOR_SIZE];
     disk.read_sector(0, &mut protective_mbr).unwrap();

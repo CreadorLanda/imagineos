@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+#[allow(dead_code)]
+
 use core::arch::asm;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -10,6 +12,8 @@ mod accounts;
 mod arch;
 #[path = "ipc.rs"]
 mod ipc;
+#[path = "input.rs"]
+mod input;
 #[path = "drivers/ata.rs"]
 pub mod ata;
 #[path = "drivers/block.rs"]
@@ -41,8 +45,10 @@ mod installer;
 mod kernel_log;
 #[path = "drivers/keyboard.rs"]
 mod keyboard;
+#[path = "drivers/mouse.rs"]
+pub mod mouse;
 #[path = "mm/memory.rs"]
-mod memory;
+pub mod memory;
 #[path = "arch/x86_64/paging.rs"]
 mod paging;
 #[path = "fs/permissions.rs"]
@@ -50,11 +56,13 @@ mod permissions;
 #[path = "power.rs"]
 mod power;
 #[path = "exec/process.rs"]
-mod process;
+pub mod process;
 #[path = "fs/ramfs.rs"]
 mod ramfs;
+#[path = "surface.rs"]
+mod surface;
 #[path = "fs/vfs.rs"]
-mod vfs;
+pub mod vfs;
 #[path = "abi/syscall.rs"]
 mod syscall;
 #[path = "time.rs"]
@@ -100,9 +108,13 @@ pub extern "C" fn kernel_entry(boot_info: *const boot_info::BootInfo) -> ! {
             .then(|| unsafe { &*boot_info.framebuffer })
             .and_then(|response| response.framebuffers().next()),
     );
+    // O servidor de display precisa do endereço físico da memória de vídeo,
+    // que é obtido subtraindo o HHDM do ponteiro virtual do framebuffer.
+    framebuffer::set_hhdm_offset(boot_info.hhdm_offset);
     if !framebuffer::load_font(EMBEDDED_FONT) {
         kernel_panic("embedded .psf is invalid!\n");
     }
+    mouse::init();
     console_write("ImagineOS Astrid w/ Dreamcore Kernel\n");
     console_write("Frame allocator ready; usable frames: ");
     console_number(frame_count.saturating_sub(1) as u64);
@@ -149,14 +161,14 @@ pub extern "C" fn kernel_entry(boot_info: *const boot_info::BootInfo) -> ! {
             response
                 .modules()
                 .iter()
-                .find(|module| module.path().to_bytes().ends_with(b"ramfs.tar"))
+                .find(|module| module.path().to_bytes().ends_with(b"initramfs.img"))
         })
         .map(|module| unsafe {
             core::slice::from_raw_parts(module.addr(), module.size() as usize)
         });
 
     let Some(ramfs_image) = ramfs_image else {
-        console_write("RAMFS ramfs.tar missing; stopping safely\n");
+        console_write("initramfs.img missing; stopping safely\n");
         halt();
     };
     ramfs::mount(ramfs_image);
@@ -297,20 +309,46 @@ fn mask_legacy_pic() {
     }
 }
 
-/// Escreve um valor hexadecimal de 16 dígitos na serial (diagnóstico).
+/// Escreve um número hexadecimal na serial (diagnóstico).
+///
+/// É hexadecimal porque endereços são lidos nesse formato; usar decimal com um
+/// prefixo "0x" foi o que tornou `0x400a40` ilegível como `0x4196928` durante a
+/// depuração do `fork`.
 #[cfg(feature = "kernel-debug")]
-pub(crate) fn serial_hex(mut value: u64) {
+pub(crate) fn serial_write_hex(mut value: u64) {
+    if value == 0 {
+        serial_write(b"0");
+        return;
+    }
     let mut digits = [0u8; 16];
-    for index in (0..digits.len()).rev() {
+    let mut cursor = digits.len();
+    while value != 0 {
+        cursor -= 1;
         let digit = (value & 0xf) as u8;
-        digits[index] = if digit < 10 {
+        digits[cursor] = if digit < 10 {
             b'0' + digit
         } else {
             b'a' + digit - 10
         };
         value >>= 4;
     }
-    serial_write(&digits);
+    serial_write(&digits[cursor..]);
+}
+
+#[cfg(feature = "kernel-debug")]
+pub(crate) fn serial_write_number(mut value: u64) {
+    let mut digits = [0u8; 20];
+    let mut cursor = digits.len();
+    if value == 0 {
+        serial_write(b"0");
+        return;
+    }
+    while value != 0 {
+        cursor -= 1;
+        digits[cursor] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    serial_write(&digits[cursor..]);
 }
 
 pub(crate) fn serial_write(bytes: &[u8]) {

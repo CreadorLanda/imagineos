@@ -7,7 +7,7 @@
 #   build/common.mk    variáveis, ferramentas e artefatos compartilhados
 #   build/kernel.mk    kernel dreamcore, bootstrap.elf e dzImage
 #   build/userland.mk  apps/utilitários Rust, libc, runtime C e TinyCC
-#   build/ramfs.mk     árvore ramfs/ e empacotamento do ramfs.tar
+#   build/ramfs.mk     árvore ramfs/ e empacotamento do initramfs.img
 #   build/iso.mk       ISO UEFI e execução no QEMU
 #
 # Cada etapa também roda isolada:

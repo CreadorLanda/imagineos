@@ -14,6 +14,8 @@
 //! no mount table, no `switch_root`/`pivot_root`, and no per-file `File` object.
 //! It removes the duplicated routing and gives a seam to grow those later.
 
+use core::cell::UnsafeCell;
+
 use crate::dfs::{self, DfsError, Metadata};
 use crate::ramfs::{self, FsError};
 
@@ -149,12 +151,57 @@ enum Backend {
     RamFs,
 }
 
+/// The current filesystem root, in the `pivot_root(2)` sense.
+///
+/// The kernel boots with the initramfs (RamFs) as `/`. A userspace init then
+/// mounts the real root (DFS) — which only *prepares* it, it does not move the
+/// root — and finally calls `pivot_root` to swap. Like Linux's global root
+/// (before mount namespaces), the switch is system-wide: every process sees the
+/// new root the instant it happens, which is exactly what the two-stage init
+/// needs (`/init` of the initramfs re-execs `/sbin/init` of the real root).
+struct SharedRootBackend(UnsafeCell<Backend>);
+unsafe impl Sync for SharedRootBackend {}
+static ROOT_BACKEND: SharedRootBackend = SharedRootBackend(UnsafeCell::new(Backend::RamFs));
+
 fn active_backend() -> Backend {
-    if dfs::is_mounted() {
-        Backend::Dfs
-    } else {
-        Backend::RamFs
+    // SAFETY: written only by `pivot_root_to` at the single call site of the
+    // `SYS_PIVOT_ROOT` syscall (no interrupts, no SMP in this kernel).
+    unsafe { *ROOT_BACKEND.0.get() }
+}
+
+/// Swaps the global root from the initramfs to `new_root`.
+///
+/// Mirrors `pivot_root(2)`: `new_root` must be a path on the *other* backend
+/// (here: the DFS, already mounted by the caller), and `put_old` is where the
+/// initramfs remains reachable — we record the name but do not relocate
+/// memory, since the RamFs pages are never freed (no reclaim in this kernel;
+/// this is the honest equivalent of "the old root stays mounted at put_old").
+/// Returns `EINVAL` when there is no DFS to pivot to, or the pivot is already
+/// done — POSIX would return the same for a root on the same mount.
+pub fn pivot_root_to(new_root: &str, put_old: &str) -> Result<(), VfsError> {
+    if new_root != "/" && !new_root.is_empty() {
+        return Err(VfsError::InvalidPath);
     }
+    if put_old.is_empty() || !put_old.starts_with('/') {
+        return Err(VfsError::InvalidPath);
+    }
+    if !dfs::is_mounted() {
+        // Pivoting without a prepared new root is exactly what Linux rejects
+        // with EINVAL ("new_root is not a mount point").
+        return Err(VfsError::InvalidPath);
+    }
+    // SAFETY: single-threaded kernel; the syscall path holds no Vfs borrows.
+    unsafe {
+        *ROOT_BACKEND.0.get() = Backend::Dfs;
+    }
+    // Sentinel para o userspace: o init da fase 2 (re-executado após o pivô)
+    // distingue "já pivotou" pela existência de /run/pivoted, o mesmo papel do
+    // marcador que initramfs do Linux deixa antes de executar a raiz real. O
+    // diretório /run precisa existir na raiz real; se não existir, o próprio
+    // DFS cria os pais (create_directory com parents).
+    let _ = dfs::create_directory_with_parents_as("/run", true, 0, 0);
+    let _ = dfs::write_file_as("/run/pivoted", b"1\n", 0o644, 0, 0);
+    Ok(())
 }
 
 /// Reports whether a persistent DFS root is currently mounted.
@@ -163,7 +210,7 @@ fn active_backend() -> Backend {
 /// (for example to pick the default font source), so it stays a free function
 /// rather than being buried in the [`FileSystem`] trait.
 pub fn has_persistent_root() -> bool {
-    dfs::is_mounted()
+    matches!(active_backend(), Backend::Dfs)
 }
 
 /// Routes [`FileSystem`] calls to whichever backend is mounted.

@@ -159,6 +159,13 @@ struct Process {
     /// `pid` que este processo está aguardando em `waitpid` (0 = não espera).
     /// Usado para bloquear o pai sem consumir CPU até o filho terminar.
     waiting_for: usize,
+    /// Ticks de timer acumulados por este processo desde a última troca.
+    ///
+    /// É por processo de propósito: um contador global fazia o quantum reiniciar
+    /// a cada troca, e dois processos acabavam se alternando a cada tick (um
+    /// milissegundo) em vez de rodar o quantum inteiro — o filho do `fork`
+    /// retomava sempre no mesmo `rip` e parecia travado.
+    quantum: u64,
     allows_disk_install: bool,
     uid: u32,
     gid: u32,
@@ -185,6 +192,7 @@ impl Process {
         zombie: false,
         exit_status: 0,
         waiting_for: 0,
+        quantum: 0,
         allows_disk_install: false,
         uid: 0,
         gid: 0,
@@ -427,6 +435,7 @@ fn load_elf_at(
         zombie: false,
         exit_status: 0,
         waiting_for: 0,
+        quantum: 0,
         allows_disk_install,
         uid: 0,
         gid: 0,
@@ -640,20 +649,76 @@ pub fn timer_tick(frame: *mut TrapFrame) -> *mut TrapFrame {
     if frame.is_null() {
         return frame;
     }
+    // Só preempta processos que estavam em **ring 3**.
+    //
+    // Um tick que interrompe o kernel (uma syscall em andamento, `cs & 3 == 0`)
+    // não deve trocar de contexto: a syscall ficaria pendurada no meio, com a
+    // pilha de kernel daquele processo "congelada" em um ponto arbitrário. Era
+    // isto que impedia o `fork` de funcionar com o timer ligado — o filho era
+    // preemptado dentro da própria largada e retomava sempre do mesmo `rip`,
+    // sem nunca executar código de usuário.
+    unsafe {
+        let interrupted = &*frame;
+        if interrupted.cs & 3 != 3 {
+            return frame;
+        }
+    }
     let scheduler = unsafe { &*SCHEDULER.0.get() };
     let current = scheduler.current;
     if !scheduler.processes[current].active {
+        return frame;
+    }
+    // Enquanto houver alguém bloqueado em `waitpid`, não pede troca: o processo
+    // que está rodando precisa consumir o tempo para produzir o evento que
+    // destrava quem espera (um `exit` de filho, por exemplo). Sem isto, dois
+    // `waitpid` concorrentes reescalavam um ao outro a cada tick e nenhum dos
+    // dois progredia.
+    if any_waiting() {
         return frame;
     }
     let has_other_runnable = scheduler
         .processes
         .iter()
         .enumerate()
-        .any(|(index, process)| index != current && process.active && !process.stopped);
+        .any(|(index, process)| {
+            index != current
+                && process.active
+                && !process.stopped
+                && !process.zombie
+                && process.waiting_for == 0
+        });
     if !has_other_runnable {
         return frame;
     }
+
+    // Quantum **por processo**: só troca depois de `TIMER_QUANTUM_TICKS` ticks
+    // deste processo. Preemptar a cada tick (10 ms) custa caro — cada troca
+    // salva e restaura o estado FPU e recarrega o CR3 — e deixava pouco tempo
+    // útil para o processo em execução, a ponto de um filho recém-criado por
+    // `fork` não conseguir executar sua primeira instrução.
+    let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+    scheduler.processes[current].quantum += 1;
+    if scheduler.processes[current].quantum < crate::time::TIMER_QUANTUM_TICKS {
+        return frame;
+    }
+    scheduler.processes[current].quantum = 0;
     schedule(frame, false)
+}
+
+/// Indica se algum processo está bloqueado em `waitpid`.
+///
+/// O `waitpid` bloqueia o pai e o `schedule` escolhe o filho. Mas quando **o
+/// próprio filho** também espera (por um neto) e o avô espera o filho, o
+/// escalonador pode ficar num ciclo em que cada `waitpid` recém-retomado
+/// reescala imediatamente, sem deixar o processo em execução consumir o seu
+/// quantum. Enquanto houver alguém bloqueado, o timer deixa de pedir troca,
+/// para que quem estiver rodando progrida até o evento que destrava os demais.
+pub fn any_waiting() -> bool {
+    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    scheduler
+        .processes
+        .iter()
+        .any(|process| process.active && process.waiting_for != 0)
 }
 
 /// Encerra o processo atual com `status`, registrando o código para que o pai
@@ -829,6 +894,18 @@ pub fn snapshot() -> ([imagineos_abi::ProcessInfo; MAX_PROCESSES], usize) {
     (result, count)
 }
 
+/// `schedule` que também informa se houve troca de processo.
+///
+/// `switched == false` só acontece quando o próprio processo atual foi o
+/// escolhido (nenhum outro estava elegível). Nesse caso quem chamou continua
+/// rodando e pode reavaliar a condição que o levou a ceder.
+fn schedule_ex(frame: *mut TrapFrame, exiting: bool) -> (*mut TrapFrame, bool) {
+    let before = unsafe { (*SCHEDULER.0.get()).current };
+    let next = schedule(frame, exiting);
+    let after = unsafe { (*SCHEDULER.0.get()).current };
+    (next, before != after)
+}
+
 fn schedule(frame: *mut TrapFrame, exiting: bool) -> *mut TrapFrame {
     let scheduler = unsafe { &mut *SCHEDULER.0.get() };
     let current = scheduler.current;
@@ -850,6 +927,21 @@ fn schedule(frame: *mut TrapFrame, exiting: bool) -> *mut TrapFrame {
         // leitor jamais veria EOF (`cat` girava em EAGAIN indefinidamente em
         // `ls | cat`). Também evita vazar os descritores do slot reutilizado.
         release_descriptors(current);
+        // Libera superfícies registradas por quem morre: um painel/terminal
+        // externo que termine não pode deixar uma janela fantasma no
+        // compositor (o snapshot checa o dono, e aqui o slot já está vazio).
+        let finished_pid = scheduler.processes[current].pid;
+        crate::surface::release_pid(finished_pid);
+        // Se o processo que terminou era o dono da tela (servidor de display),
+        // devolve o console: sem isto o último frame desenhado pelo WM ficava
+        // congelado na VGA, pois o console tinha o desenho desativado e nenhum
+        // novo processo redicionava a tela. Limpar dá ao shell um console em
+        // branco, e a entrada volta para o caminho de teclado do kernel.
+        if crate::input::is_captured() {
+            crate::input::release();
+            crate::framebuffer::set_active(true);
+            crate::framebuffer::clear();
+        }
         // Um processo que esperava por este filho pode voltar a rodar.
         let finished = scheduler.processes[current].pid;
         for index in 0..MAX_PROCESSES {
@@ -1198,6 +1290,7 @@ pub fn fork_current(frame: *mut TrapFrame) -> *mut TrapFrame {
         zombie: false,
         exit_status: 0,
         waiting_for: 0,
+        quantum: 0,
         allows_disk_install: parent.allows_disk_install,
         uid: parent.uid,
         gid: parent.gid,
@@ -1215,6 +1308,9 @@ pub fn fork_current(frame: *mut TrapFrame) -> *mut TrapFrame {
         fpu_state,
     };
     scheduler.count = scheduler.count.max(slot + 1);
+    // O filho começa com o quantum cheio (o campo já é inicializado em 0),
+    // garantindo que ele execute antes de o timer pedir a troca.
+    scheduler.processes[slot].quantum = 0;
     unsafe {
         (*frame).rax = pid as u64;
     }
@@ -1235,10 +1331,22 @@ pub fn fork_current(frame: *mut TrapFrame) -> *mut TrapFrame {
 /// volta a rodar quando o filho morre (ou por preempção normal).
 ///
 /// Se não houver filhos correspondentes, devolve `-ECHILD` (`-10`).
-pub fn waitpid_current(mut frame: *mut TrapFrame, pid: i64, status_pointer: u64) -> *mut TrapFrame {
-    let (parent_pid, wanted) = {
+/// `waitpid(pid, &status, options)`: espera um filho e coleta o status.
+///
+/// Suporta a flag POSIX `WNOHANG`: sem ela, o comportamento mantém o ciclo
+/// EAGAIN + repetição já validado; com ela, devolve **0** (pid 0) imediatamente
+/// quando nenhum filho terminou, sem ceder a CPU — o padrão que supervisores
+/// de serviços (Horust) e shells de trabalho usam para varrer filhos.
+pub fn waitpid_current(frame: *mut TrapFrame, pid: i64, status_pointer: u64, options: i64) -> *mut TrapFrame {
+    // O slot do pai é capturado **uma vez**. Usar `scheduler.current` a cada
+    // volta do laço era o bug: depois de `schedule` trocar de processo, o
+    // `current` apontava para outro processo, e `waiting_for` era escrito nele.
+    // Isso marcava o init e o próprio filho como "esperando pelo pid 3",
+    // deixando todos inelegíveis e travando o escalonador.
+    let (parent_slot, parent_pid, wanted) = {
         let scheduler = unsafe { &*SCHEDULER.0.get() };
-        (scheduler.processes[scheduler.current].pid, pid)
+        let parent_slot = scheduler.current;
+        (parent_slot, scheduler.processes[parent_slot].pid, pid)
     };
 
     // Primeiro procura um corpo já pronto (zumbi) para não bloquear sem motivo.
@@ -1258,26 +1366,46 @@ pub fn waitpid_current(mut frame: *mut TrapFrame, pid: i64, status_pointer: u64)
             return frame;
         }
 
+        // WNOHANG: nunca bloqueia. Com filho vivo e nenhum terminado, o
+        // resultado é 0 ("pid 0") conforme POSIX, sem yield.
+        if options & imagineos_abi::WNOHANG != 0 {
+            unsafe {
+                (*frame).rax = 0;
+            }
+            return frame;
+        }
+
         // Há filho vivo: marca quem esperamos e cede a CPU. O `schedule`
         // remove `waiting_for` quando o filho termina, e este laço é
-        // reavaliado quando o pai for escalonado de novo.
+        // reavaliado quando o pai for escalonado de novo. A marcação vai sempre
+        // no slot do pai, capturado no início.
         {
             let scheduler = unsafe { &mut *SCHEDULER.0.get() };
-            let current = scheduler.current;
-            // `wanted < 0` ou 0: espera qualquer filho, então sinalizamos com o
-            // próprio pai (0 como sentinela "qualquer"); o schedule limpa o
-            // campo quando qualquer filho termina.
-            scheduler.processes[current].waiting_for = if wanted > 0 {
+            // `wanted <= 0`: espera qualquer filho; `usize::MAX` sinaliza isso e
+            // o `schedule` limpa o campo quando qualquer filho termina.
+            scheduler.processes[parent_slot].waiting_for = if wanted > 0 {
                 wanted as usize
             } else {
                 usize::MAX
             };
         }
-        frame = schedule(frame, false);
-        if frame.is_null() {
-            return frame;
+        // O filho ainda está vivo. Devolve `EAGAIN` ao userspace e **deixa o
+        // pai continuar rodando** (sem trocar de contexto aqui).
+        //
+        // Trocar de processo dentro do `waitpid` não funciona: o stub do
+        // `int 0x80` faz `iretq` para o frame devolvido, o userspace retoma
+        // logo **após** o `int 0x80` — ou seja, o laço do `waitpid` no kernel
+        // seria abandonado com a pilha de kernel suja, e o pai acharia que o
+        // `waitpid` terminou sem ter coletado o filho (foi assim que os zumbis
+        // se acumularam até esgotar os slots).
+        //
+        // O caminho correto é do POSIX: o pai repete a chamada. O `yield`
+        // abaixo cede a CPU para o filho progredir, e o usuário chama de novo.
+        unsafe {
+            (*frame).rax = (-11i64) as u64; // EAGAIN
         }
-        // Depois de voltar ao pai, tenta coletar de novo.
+        let (next, _) = schedule_ex(frame, false);
+        return next;
     }
 }
 
@@ -1308,6 +1436,7 @@ fn reap_child(parent_pid: usize, wanted: i64, status_pointer: u64) -> (Option<us
             }
         }
     }
+
 
     let Some((child_pid, exit_status)) = collected else {
         return (None, found_any);

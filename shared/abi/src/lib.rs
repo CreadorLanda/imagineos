@@ -1,6 +1,6 @@
 #![no_std]
 
-pub const ABI_VERSION: u64 = 3;
+pub const ABI_VERSION: u64 = 4;
 
 pub const SYS_WRITE: u64 = 1;
 pub const SYS_READ: u64 = 2;
@@ -53,6 +53,114 @@ pub const SYS_FORK: u64 = 45;
 pub const SYS_WAITPID: u64 = 46;
 /// `execve(path, argv, envp)`: substitui a imagem do processo atual.
 pub const SYS_EXECVE: u64 = 47;
+// Primitivas de display: um servidor de janelas em userspace precisa enxergar
+// o framebuffer e receber os eventos de entrada.
+/// `fb_info(&FramebufferInfo)`: descreve o framebuffer ativo.
+pub const SYS_FB_INFO: u64 = 48;
+/// `fb_map(&FramebufferInfo)`: mapeia o framebuffer no processo atual.
+pub const SYS_FB_MAP: u64 = 49;
+/// `input_poll(&InputEvent)`: retira um evento de entrada (0 se não houver).
+pub const SYS_INPUT_POLL: u64 = 50;
+/// `console_release()`: o servidor de display assume a tela e o console do
+/// kernel deixa de desenhar nela.
+pub const SYS_CONSOLE_RELEASE: u64 = 51;
+/// `pointer_position()`: devolve `(x << 32) | y` do ponteiro, para o servidor
+/// de display desenhar o cursor sem recontar cada movimento.
+pub const SYS_POINTER_POSITION: u64 = 52;
+// Protocolo de superfícies (janelas cliente/servidor):
+// um processo qualquer pode registrar uma superfície de pixels e o servidor
+// de display compõe na tela e encaminha eventos. O dono é identificado pelo
+// PID, então não há tokens nem permissões — como o X11 antes da autenticação.
+/// `surface_create(&SurfaceInfo)`: registra uma superfície no kernel e mapeia
+/// o buffer compartilhado no processo atual. `SurfaceInfo.address` volta com o
+/// endereço virtual.
+pub const SYS_SURFACE_CREATE: u64 = 53;
+/// `surface_present(id, flags)`: marca a superfície como visível (1) ou
+/// oculta (0) e pede recomposição. Devolve 0 em caso de sucesso.
+pub const SYS_SURFACE_PRESENT: u64 = 54;
+/// `surface_flush(id)`: publica um frame escrito no buffer; o compositor
+/// passa a copiar da região mapeada. Sem esta chamada o cliente desenha
+/// "no escuro" (o kernel só copia quando o frame está consistente).
+pub const SYS_SURFACE_FLUSH: u64 = 55;
+/// `surface_destroy(id)`: remove a superfície, desmapeia e libera o buffer.
+pub const SYS_SURFACE_DESTROY: u64 = 56;
+/// `surface_poll(&SurfaceEvent)`: retira um evento dirigido a uma superfície
+/// deste processo (0 se não houver). O kernel roteia com base no dono.
+pub const SYS_SURFACE_POLL: u64 = 57;
+/// `surface_snapshot(&[SurfaceSnapshot]) -> count`: lista as superfícies
+/// visíveis e mapeia os buffers no processo chamador (o servidor).
+pub const SYS_SURFACE_SNAPSHOT: u64 = 58;
+/// `surface_send_event(&SurfaceEvent)`: entrega um evento ao dono da
+/// superfície indicada (o servidor encaminha teclas e cliques).
+pub const SYS_SURFACE_SEND_EVENT: u64 = 59;
+/// `pivot_root(new_root, put_old)`: troca a raiz do sistema (initramfs → raiz
+/// real no disco). POSIX/Linux: o initramfs chama após montar a nova raiz.
+pub const SYS_PIVOT_ROOT: u64 = 60;
+/// Flags do `waitpid`: `WNOHANG` — não bloqueia; devolve 0 se nenhum filho
+/// terminou. Necessário para supervisores de serviços (Horust) e shells.
+pub const WNOHANG: i64 = 1;
+
+/// Superfícies de clientes registráveis por processo; o painel usa 1, um
+/// cliente tipo terminal usaria outra.
+pub const MAX_SURFACES: usize = 8;
+/// Tamanho máximo do buffer de uma superfície, em pixels (320x200 como as
+/// janelas internas do compositor).
+pub const SURFACE_MAX_WIDTH: u32 = 320;
+pub const SURFACE_MAX_HEIGHT: u32 = 200;
+pub const SURFACE_MAX_PIXELS: usize =
+    (SURFACE_MAX_WIDTH as usize) * (SURFACE_MAX_HEIGHT as usize);
+
+/// Descrição de uma superfície de cliente, preenchida pelo chamador e
+/// completada pelo kernel (`address`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SurfaceInfo {
+    /// Id atribuído pelo kernel (0 se o pedido falhar).
+    pub id: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Pixels por linha no buffer mapeado (pode exceder `width`).
+    pub pitch: u32,
+    /// Endereço virtual do buffer no processo chamador.
+    pub address: u64,
+}
+
+/// Eventos dirigidos ao dono de uma superfície.
+pub const SURFACE_EVENT_KEY: u32 = 1;
+pub const SURFACE_EVENT_MOUSE_MOVE: u32 = 2;
+pub const SURFACE_EVENT_MOUSE_BUTTON: u32 = 3;
+/// O compositor moveu a janela (`x`/`y` são a nova origem na tela).
+pub const SURFACE_EVENT_MOVED: u32 = 4;
+/// O compositor escondeu a janela (mínima ou fechada pelo WM).
+pub const SURFACE_EVENT_HIDDEN: u32 = 5;
+
+/// Snapshot de uma superfície visível, preenchido pelo kernel em
+/// `surface_snapshot`. `address` já vem mapeado no espaço do servidor.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SurfaceSnapshot {
+    pub id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    /// Endereço virtual do buffer no espaço do servidor de display.
+    pub address: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SurfaceEvent {
+    /// Superfície alvo.
+    pub surface: u32,
+    /// Um dos `SURFACE_EVENT_*`.
+    pub kind: u32,
+    pub x: i32,
+    pub y: i32,
+    pub button: u32,
+    pub pressed: u32,
+    /// Caractere (para `SURFACE_EVENT_KEY`).
+    pub key: u32,
+}
 
 pub const SIGNAL_HUP: u64 = 1;
 pub const SIGNAL_INT: u64 = 2;
@@ -156,6 +264,54 @@ impl Default for SpawnIo {
             environment_count: 0,
         }
     }
+}
+
+/// Descrição do framebuffer para o servidor de display.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FramebufferInfo {
+    /// Endereço **virtual** onde o framebuffer aparece no processo chamador,
+    /// preenchido por `fb_map`.
+    pub address: u64,
+    /// Endereço físico da memória de vídeo (informativo).
+    pub physical_address: u64,
+    pub width: u32,
+    pub height: u32,
+    /// Bytes por linha (pode ser maior que `width * 4`).
+    pub pitch: u32,
+    pub red_shift: u8,
+    pub green_shift: u8,
+    pub blue_shift: u8,
+    pub reserved: u8,
+}
+
+/// Tipos de evento de entrada entregues ao servidor de display.
+pub const INPUT_KEY: u32 = 1;
+pub const INPUT_MOUSE_MOVE: u32 = 2;
+pub const INPUT_MOUSE_BUTTON: u32 = 3;
+
+/// A base do espaço virtual onde os buffers de superfície são mapeados. Fica
+/// acima da heap (`USER_HEAP_LIMIT` = 64 MiB sobre `0x1_0000_0000`) e longe
+/// do framebuffer (`0x4000_0000_0000`). Cada superfície recebe uma fatia
+/// alinhada de 1 MiB, então o endereço do cliente nunca colide.
+pub const SURFACE_REGION_BASE: u64 = 0x0000_0001_4000_0000;
+pub const SURFACE_REGION_STRIDE: u64 = 0x10_0000; // 1 MiB
+
+/// Um evento de entrada em formato fixo (sem ponteiros).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InputEvent {
+    /// Um dos `INPUT_*`.
+    pub kind: u32,
+    /// Tecla (para `INPUT_KEY`): o caractere ou um código de tecla especial.
+    pub key: u32,
+    /// Posição do cursor (para eventos de mouse).
+    pub x: i32,
+    pub y: i32,
+    /// Botão (1 = esquerdo, 2 = direito, 3 = meio).
+    pub button: u32,
+    /// 1 = pressionado, 0 = liberado.
+    pub pressed: u32,
 }
 
 #[repr(C)]

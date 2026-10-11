@@ -71,7 +71,7 @@ pub fn install_primary_master(
     let config = ramfs::read("/system/install/limine.conf").ok_or(InstallError::MissingPayload)?;
     let startup = ramfs::read("/system/install/startup.nsh").ok_or(InstallError::MissingPayload)?;
     let ramfs_image =
-        ramfs::read("/system/install/ramfs-installed.tar").ok_or(InstallError::MissingPayload)?;
+        ramfs::read("/system/install/initramfs-installed.tar").ok_or(InstallError::MissingPayload)?;
     install_configured(
         &device,
         bootstrap,
@@ -168,8 +168,8 @@ fn install_configured(
             cluster_count: 0,
         },
         FileToInstall {
-            name: *b"RAMFS   TAR",
-            long_name: "ramfs.tar",
+            name: *b"INITRAM IMG",
+            long_name: "initramfs.img",
             contents: ramfs_image,
             first_cluster: 0,
             cluster_count: 0,
@@ -753,9 +753,9 @@ mod tests {
                 cluster_count: 0,
             },
             FileToInstall {
-                name: *b"RAMFS   TAR",
-                long_name: "ramfs.tar",
-                contents: b"ramfs",
+                name: *b"INITRAM IMG",
+                long_name: "initramfs.img",
+                contents: b"initramfs",
                 first_cluster: 0,
                 cluster_count: 0,
             },

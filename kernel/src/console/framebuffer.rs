@@ -28,6 +28,9 @@ struct Console {
     ansi_value: u16,
     ansi_has_value: bool,
     foreground: u32,
+    /// Quando falso, o console do kernel não desenha: a tela pertence ao
+    /// servidor de display de userspace.
+    active: bool,
 }
 
 impl Console {
@@ -56,6 +59,7 @@ impl Console {
             ansi_value: 0,
             ansi_has_value: false,
             foreground: 0xdce8e8,
+            active: true,
         }
     }
 }
@@ -63,6 +67,14 @@ impl Console {
 struct SharedConsole(UnsafeCell<Console>);
 unsafe impl Sync for SharedConsole {}
 static CONSOLE: SharedConsole = SharedConsole(UnsafeCell::new(Console::empty()));
+
+/// Liga o console do kernel na impressão (usado depois que o servidor de
+/// display assume a tela).
+#[allow(dead_code)]
+pub(crate) fn set_active(active: bool) {
+    let console = unsafe { &mut *CONSOLE.0.get() };
+    console.active = active;
+}
 
 pub fn init(framebuffer: Option<Framebuffer<'_>>) {
     let Some(framebuffer) = framebuffer else {
@@ -291,6 +303,58 @@ pub fn write_char(character: char) {
     }
 }
 
+/// Descrição do framebuffer para um cliente de display em userspace.
+///
+/// O servidor de display precisa saber onde desenhar (endereço físico mapeado),
+/// o formato e as dimensões. O deslocamento dos canais já vem calculado para
+/// que o userspace não precise repetir a aritmética das máscaras do Limine.
+#[derive(Clone, Copy)]
+pub struct Description {
+    pub physical_address: u64,
+    pub width: usize,
+    pub height: usize,
+    pub pitch: usize,
+    pub red_shift: u8,
+    pub green_shift: u8,
+    pub blue_shift: u8,
+}
+
+/// Devolve a descrição do framebuffer, ou `None` se não houver um ativo.
+pub fn description() -> Option<Description> {
+    let console = unsafe { &*CONSOLE.0.get() };
+    if console.address.is_null() || console.width == 0 || console.height == 0 {
+        return None;
+    }
+    // O `Console` guarda o ponteiro já resolvido no HHDM. Para o userspace o que
+    // importa é o endereço **físico**, que é o que aparece na memória de vídeo.
+    let virtual_address = console.address as u64;
+    let physical = virtual_address.checked_sub(hhdm_offset())?;
+    Some(Description {
+        physical_address: physical,
+        width: console.width,
+        height: console.height,
+        pitch: console.pitch,
+        red_shift: console.red_shift,
+        green_shift: console.green_shift,
+        blue_shift: console.blue_shift,
+    })
+}
+
+/// Guarda o deslocamento do HHDM para converter ponteiros virtuais em físicos.
+static mut HHDM_OFFSET: u64 = 0;
+
+fn hhdm_offset() -> u64 {
+    unsafe { HHDM_OFFSET }
+}
+
+/// Registra o deslocamento do HHDM, necessário para [`description`].
+pub fn set_hhdm_offset(offset: u64) {
+    unsafe {
+        HHDM_OFFSET = offset;
+    }
+}
+
+/// Limpa a tela com a cor de fundo do console do kernel.
 pub(crate) fn clear() {
     let console = unsafe { &mut *CONSOLE.0.get() };
     if console.address.is_null() {
@@ -464,7 +528,7 @@ fn glyph_index(console: &Console, font: &[u8], character: char) -> Option<usize>
 }
 
 fn pixel(console: &Console, x: usize, y: usize, color: u32) {
-    if x >= console.width || y >= console.height {
+    if !console.active || x >= console.width || y >= console.height {
         return;
     }
     let red = ((color >> 16) & 0xff) << console.red_shift;

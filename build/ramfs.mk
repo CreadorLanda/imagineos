@@ -1,14 +1,16 @@
 # ==============================================================================
-# ImagineOS - estrutura e imagem do RAMFS
+# ImagineOS - estrutura e imagem do initramfs (estilo Linux/FHS)
 # ==============================================================================
 #
-# Cria a árvore `ramfs/` na raiz e empacota o USTAR `.build/ramfs.tar`, que é
-# carregado como initramfs pelo Limine. O tar inclui:
+# Cria a árvore `ramfs/` na raiz e empacota o USTAR `.build/initramfs.tar`,
+# que o Limine carrega como módulo de boot. A árvore segue o FHS:
+#   * a árvore de dados de `ramfs/` com a fonte PSF copiada;
+#   * os headers da libc e as libs estáticas (libdreamcore.a, libc.a, libm.a);
 #   * a árvore de dados de `ramfs/` com a fonte PSF copiada;
 #   * os headers da libc e as libs estáticas (libdreamcore.a, libc.a, libm.a);
 #   * os objetos crt0/crt1/crti/crtn e o linker script do userspace;
 #   * os binários compilados (init, getty, shell e utilitários);
-#   * o payload do instalador (bootstrap, dzImage, Limine e ramfs instalado).
+#   * o payload do instalador (bootstrap, dzImage, Limine e initramfs instalado).
 #
 # Uso isolado:  make -f build/ramfs.mk
 # Alvos:        ramfs, ramfs-image
@@ -22,6 +24,11 @@ include $(dir $(lastword $(MAKEFILE_LIST)))common.mk
 # bootstrap/dzImage e userland.mk produz os programas e as libs de userspace.
 KERNEL_MK   := $(ROOT)/build/kernel.mk
 USERLAND_MK := $(ROOT)/build/userland.mk
+
+# Todo arquivo da árvore `ramfs/` é dependência do tar. Sem isto, editar um
+# arquivo de `ramfs/` (um script em `etc/`, uma fonte) não disparava a
+# reconstrução e a imagem continuava com a versão antiga em cache.
+RAMFS_SOURCES := $(shell find $(RAMFS_ROOT) -type f -o -type l 2>/dev/null)
 
 .PHONY: ramfs ramfs-image ramfs-inputs
 
@@ -43,7 +50,7 @@ ramfs-image: ramfs-inputs
 # por `ramfs-inputs` e usados diretamente nos comandos abaixo. Declará-los como
 # pré-requisitos aqui exigiria as regras de kernel.mk/userland.mk, que é
 # exatamente o acoplamento que a divisão elimina.
-$(RAMFS_IMAGE): ramfs \
+$(BUILD_DIR)/initramfs.tar: ramfs $(RAMFS_SOURCES) \
                 $(LIMINE_DIR)/BOOTX64.EFI $(ROOT)/boot/limine.conf \
                 $(ROOT)/boot/startup.nsh $(USERLAND_MK) $(KERNEL_MK)
 	@test -f $(BOOTSTRAP) || (echo "bootstrap.elf ausente"; exit 1)
@@ -77,6 +84,11 @@ $(RAMFS_IMAGE): ramfs \
 	for utility in $(USER_C_UTILITIES); do \
 		cp $(BUILD_DIR)/user/utilities/$$utility $(BUILD_DIR)/ramfs/bin/$$utility; \
 	done
+	# Clientes EDE (protocolo de superfícies). O binário sai como
+	# .build/user/bin/ede-<nome>, copiado para /bin/ede-<nome>.
+	for program in $(notdir $(EDE_PROGRAMS)); do \
+		cp $(BUILD_DIR)/user/bin/$$program $(BUILD_DIR)/ramfs/bin/$$program; \
+	done
 
 	# Tar para o instalador do SO
 	tar --format=ustar --numeric-owner --owner=0 --group=0 \
@@ -90,8 +102,7 @@ $(RAMFS_IMAGE): ramfs \
 	cp $(LIMINE_DIR)/BOOTX64.EFI $(BUILD_DIR)/ramfs/system/install/BOOTX64.EFI
 	cp $(ROOT)/boot/limine.conf $(BUILD_DIR)/ramfs/system/install/limine.conf
 	cp $(ROOT)/boot/startup.nsh $(BUILD_DIR)/ramfs/system/install/startup.nsh
-	cp $(RAMFS_INST_IMG) $(BUILD_DIR)/ramfs/system/install/ramfs-installed.tar
-
-	# Tar final do RAMFS
+	cp $(RAMFS_INST_IMG) $(BUILD_DIR)/ramfs/system/install/initramfs-installed.tar
+	# Tar final do initramfs
 	tar --format=ustar --numeric-owner --owner=0 --group=0 \
 		-C $(BUILD_DIR)/ramfs -cf $@ bin dev etc sbin home system tmp usr

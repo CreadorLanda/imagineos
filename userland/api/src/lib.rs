@@ -4,12 +4,15 @@ pub use imagineos_abi as abi;
 
 pub mod args;
 pub mod console;
+pub mod display;
+pub mod font;
 pub mod fs;
 pub mod kernel_log;
 pub mod legacy;
 pub mod process;
 pub mod shutdown;
 pub mod signals;
+pub mod surface;
 pub mod syscall;
 pub mod users;
 

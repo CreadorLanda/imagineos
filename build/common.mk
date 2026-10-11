@@ -51,8 +51,8 @@ DISTRO_DIR     := $(BUILD_DIR)/distro
 KERNEL         := $(ROOT)/target/$(TARGET)/release/dreamcore
 BOOTSTRAP      := $(BUILD_DIR)/bootstrap.elf
 DZ_IMAGE       := $(BUILD_DIR)/dzImage
-RAMFS_IMAGE    := $(BUILD_DIR)/ramfs.tar
-RAMFS_INST_IMG := $(BUILD_DIR)/ramfs-installed.tar
+RAMFS_IMAGE    := $(BUILD_DIR)/initramfs.tar
+RAMFS_INST_IMG := $(BUILD_DIR)/initramfs-installed.tar
 ISO_DIR        := $(BUILD_DIR)/iso
 ISO_IMAGE      := $(DISTRO_DIR)/$(K_NAME)-$(shell date +%Y-%m-%d-%H-%M)-$(CODENAME).iso
 DISK_IMAGE     ?= $(BUILD_DIR)/imagineos-disk.img
@@ -77,8 +77,11 @@ FONT_ASSET      := $(ROOT)/tools/assets/zap-vga16.psf
 
 RAMFS_ROOT     := $(ROOT)/ramfs
 RAMFS_DIRS     := bin dev etc sbin home system/fonts system/install tmp usr
-USER_UTILITIES := cat dmesg distroinstall fdtest globalconf grep kill ls mkdir ps rm shutdown su sudo touch uname vi hello
+USER_UTILITIES := cat dmesg display distroinstall fdtest forktest globalconf grep kill ls mkdir ps rm shutdown su sudo touch uname vi hello
 USER_C_UTILITIES := hello_c tcc
+# Clientes EDE do protocolo de superfícies (userland/apps/ede/*.rs).
+EDE_SOURCES := $(wildcard $(ROOT)/userland/apps/ede/*.rs)
+EDE_PROGRAMS := $(patsubst $(ROOT)/userland/apps/ede/%.rs,$(BUILD_DIR)/user/bin/ede-%,$(EDE_SOURCES))
 
 # Manifestos e libs do userland
 USER_API_MANIFEST       := $(ROOT)/userland/api/Cargo.toml
@@ -100,6 +103,7 @@ USER_CRT_RLIB           := $(BUILD_DIR)/user/libimagineos_crt.a
 
 USER_PROGRAMS           := $(BUILD_DIR)/user/sbin/init \
                            $(BUILD_DIR)/user/sbin/getty \
+                           $(BUILD_DIR)/user/sbin/horust \
                            $(BUILD_DIR)/user/bin/shell \
                            $(addprefix $(BUILD_DIR)/user/utilities/,$(USER_UTILITIES) $(USER_C_UTILITIES))
 

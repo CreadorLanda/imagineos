@@ -165,18 +165,69 @@ pub fn fork() -> Result<i64> {
 /// vem no formato POSIX (código de saída nos 8 bits altos); use
 /// [`exit_code`] para extraí-lo.
 pub fn waitpid(pid: i64) -> Result<(usize, u32)> {
-    let mut status: u32 = 0;
-    let result = checked(syscall::invoke(
-        crate::abi::SYS_WAITPID,
-        [pid as u64, (&mut status as *mut u32) as u64, 0, 0, 0, 0],
-    ))?;
-    let child = usize::try_from(result).map_err(|_| Error::INVALID_ARGUMENT)?;
-    Ok((child, status))
+    // O kernel devolve `EAGAIN` enquanto o filho não termina; o caso é normal e
+    // o chamador deve repetir (como o `waitpid` do POSIX, que bloqueia). Aqui a
+    // repetição é feita dentro desta função, cedendo a CPU entre as tentativas
+    // para o filho progredir.
+    loop {
+        let mut status: u32 = 0;
+        match syscall::invoke(
+            crate::abi::SYS_WAITPID,
+            [pid as u64, (&mut status as *mut u32) as u64, 0, 0, 0, 0],
+        ) {
+            0xffff_ffff_ffff_fff5 /* -11 == EAGAIN */ => {
+                if yield_now().is_err() {
+                    return Err(Error::INVALID_ARGUMENT);
+                }
+            }
+            result => {
+                let result = checked(result)?;
+                let child = usize::try_from(result).map_err(|_| Error::INVALID_ARGUMENT)?;
+                return Ok((child, status));
+            }
+        }
+    }
 }
 
 /// Extrai o código de saída de um `status` devolvido por [`waitpid`].
 pub fn exit_code(status: u32) -> i32 {
     ((status >> 8) & 0xff) as i32
+}
+
+/// `waitpid(pid, &status, WNOHANG)`: varre filhos sem bloquear.
+///
+/// Devolve `Ok(None)` quando nenhum filho terminou ainda (POSIX: retorno 0),
+/// `Ok(Some((pid, status)))` quando coletou um, e erro para ECHILD.
+pub fn waitpid_nonblocking(pid: i64) -> Result<Option<(usize, u32)>> {
+    let mut status: u32 = 0;
+    let result = syscall::invoke(
+        crate::abi::SYS_WAITPID,
+        [pid as u64, (&mut status as *mut u32) as u64, crate::abi::WNOHANG as u64, 0, 0, 0],
+    );
+    if result == 0 {
+        return Ok(None);
+    }
+    let child = usize::try_from(checked(result)?).map_err(|_| Error::INVALID_ARGUMENT)?;
+    Ok(Some((child, status)))
+}
+
+/// `pivot_root(new_root, put_old)`: troca a raiz do sistema do initramfs para
+/// a raiz real montada pelo chamador. Só retorna em erro.
+pub fn pivot_root(new_root: &str, put_old: &str) -> Result<()> {
+    let mut new_root_bytes = [0u8; crate::abi::MAX_MUTABLE_PATH];
+    let mut put_old_bytes = [0u8; crate::abi::MAX_MUTABLE_PATH];
+    let new_len = new_root.len();
+    let old_len = put_old.len();
+    if new_len >= new_root_bytes.len() || old_len >= put_old_bytes.len() {
+        return Err(Error::INVALID_ARGUMENT);
+    }
+    new_root_bytes[..new_len].copy_from_slice(new_root.as_bytes());
+    put_old_bytes[..old_len].copy_from_slice(put_old.as_bytes());
+    checked(syscall::invoke(
+        crate::abi::SYS_PIVOT_ROOT,
+        [new_root_bytes.as_ptr() as u64, put_old_bytes.as_ptr() as u64, 0, 0, 0, 0],
+    ))
+    .map(|_| ())
 }
 
 /// Creates a pipe, returning `(read_end, write_end)` descriptors.

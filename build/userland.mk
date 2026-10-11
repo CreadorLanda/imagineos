@@ -15,7 +15,7 @@ include $(dir $(lastword $(MAKEFILE_LIST)))common.mk
 
 .PHONY: user-programs user-libs tcc-source c-app
 
-user-programs: $(USER_PROGRAMS)
+user-programs: $(USER_PROGRAMS) $(EDE_PROGRAMS)
 
 user-libs: $(BUILD_DIR)/user/libdreamcore.a $(BUILD_DIR)/user/crt.o $(BUILD_DIR)/user/crt_empty.o
 
@@ -36,7 +36,7 @@ $(USER_RUNTIME_RLIB): $(USER_RUNTIME_MANIFEST) $(ROOT)/userland/runtimes/rust/sr
 # Programas Rust de userspace
 # ------------------------------------------------------------------------------
 
-# Apps principais (init, getty, shell) em userland/apps/
+# # Apps principais (init, getty, horust) em userland/apps/
 $(BUILD_DIR)/user/sbin/%: $(ROOT)/userland/apps/%.rs $(ROOT)/userland/linker.ld \
                           $(USER_API_RLIB) $(USER_RUNTIME_RLIB)
 	@mkdir -p $(dir $@)
@@ -54,16 +54,60 @@ $(BUILD_DIR)/user/bin/shell: $(filter-out %/tests.rs,$(SHELL_SOURCES)) $(ROOT)/u
                              $(USER_API_RLIB) $(USER_RUNTIME_RLIB)
 	@mkdir -p $(dir $@)
 	$(RUSTC) --crate-name shell --edition 2021 --target $(TARGET) \
-		--extern imagineos=$(USER_API_RLIB) --extern imagineos_rt=$(USER_RUNTIME_RLIB) \
-		-L dependency=$(USER_API_DEPS) -L dependency=$(USER_RUNTIME_DEPS) \
-		-C panic=abort -C relocation-model=static \
-		-C link-arg=-T$(ROOT)/userland/linker.ld \
-		$(ROOT)/userland/apps/shell/main.rs -o $@
+	--extern imagineos=$(USER_API_RLIB) --extern imagineos_rt=$(USER_RUNTIME_RLIB) \
+	-L dependency=$(USER_API_DEPS) -L dependency=$(USER_RUNTIME_DEPS) \
+	-C panic=abort -C relocation-model=static \
+	-C link-arg=-T$(ROOT)/userland/linker.ld \
+	$(ROOT)/userland/apps/shell/main.rs -o $@
+
+# Horust (init-style): multi-módulo em userland/apps/horust/, instalado em
+# /sbin/horust. O horust-lite.rs raiz é o binário; os módulos ficam ao lado.
+HORUST_SOURCES := $(wildcard $(ROOT)/userland/apps/horust/*.rs)
+
+$(BUILD_DIR)/user/sbin/horust: $(filter-out %/tests.rs,$(HORUST_SOURCES)) \
+                               $(ROOT)/userland/apps/horust-lite.rs \
+                               $(ROOT)/userland/linker.ld $(USER_API_RLIB) $(USER_RUNTIME_RLIB)
+	@mkdir -p $(dir $@)
+	$(RUSTC) --crate-name horust --edition 2021 --target $(TARGET) \
+	--extern imagineos=$(USER_API_RLIB) --extern imagineos_rt=$(USER_RUNTIME_RLIB) \
+	-L dependency=$(USER_API_DEPS) -L dependency=$(USER_RUNTIME_DEPS) \
+	-C panic=abort -C relocation-model=static \
+	-C link-arg=-T$(ROOT)/userland/linker.ld \
+	$(ROOT)/userland/apps/horust-lite.rs -o $@
+
+# Display server/window manager (multi-module, separado em seu diretório).
+DISPLAY_SOURCES := $(wildcard $(ROOT)/userland/apps/display/*.rs)
+
+$(BUILD_DIR)/user/utilities/display: $(DISPLAY_SOURCES) $(ROOT)/userland/linker.ld \
+                                    $(USER_API_RLIB) $(USER_RUNTIME_RLIB)
+	@mkdir -p $(dir $@)
+	$(RUSTC) --crate-name display --edition 2021 --target $(TARGET) \
+	--extern imagineos=$(USER_API_RLIB) --extern imagineos_rt=$(USER_RUNTIME_RLIB) \
+	-L dependency=$(USER_API_DEPS) -L dependency=$(USER_RUNTIME_DEPS) \
+	-C panic=abort -C relocation-model=static \
+	-C link-arg=-T$(ROOT)/userland/linker.ld \
+	$(ROOT)/userland/apps/display/main.rs -o $@
+
+# Clientes externos do protocolo de superfícies (EDE): um ELF por arquivo em
+# userland/apps/ede/*.rs, instalados em /bin. A regra genérica de /bin (abaixo)
+# cobre estes arquivos também, mas o crate name com hífen precisa de ajuste.
+EDE_SOURCES := $(wildcard $(ROOT)/userland/apps/ede/*.rs)
+
+EDE_PROGRAMS := $(patsubst $(ROOT)/userland/apps/ede/%.rs,$(BUILD_DIR)/user/bin/ede-%,$(EDE_SOURCES))
+
+$(BUILD_DIR)/user/bin/ede-%: $(ROOT)/userland/apps/ede/%.rs $(ROOT)/userland/linker.ld \
+                             $(USER_API_RLIB) $(USER_RUNTIME_RLIB)
+	@mkdir -p $(dir $@)
+	$(RUSTC) --crate-name ede$(subst -,_,$*) --edition 2021 --target $(TARGET) \
+	--extern imagineos=$(USER_API_RLIB) --extern imagineos_rt=$(USER_RUNTIME_RLIB) \
+	-L dependency=$(USER_API_DEPS) -L dependency=$(USER_RUNTIME_DEPS) \
+	-C panic=abort -C relocation-model=static \
+	-C link-arg=-T$(ROOT)/userland/linker.ld $< -o $@
 
 $(BUILD_DIR)/user/bin/%: $(ROOT)/userland/apps/%.rs $(ROOT)/userland/linker.ld \
                          $(USER_API_RLIB) $(USER_RUNTIME_RLIB)
 	@mkdir -p $(dir $@)
-	$(RUSTC) --crate-name $* --edition 2021 --target $(TARGET) \
+	$(RUSTC) --crate-name $(subst -,_,$*) --edition 2021 --target $(TARGET) \
 		--extern imagineos=$(USER_API_RLIB) --extern imagineos_rt=$(USER_RUNTIME_RLIB) \
 		-L dependency=$(USER_API_DEPS) -L dependency=$(USER_RUNTIME_DEPS) \
 		-C panic=abort -C relocation-model=static \

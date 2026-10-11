@@ -101,5 +101,6 @@ compila o bootstrap e empacota os programas de `userland/` no USTAR.
 ## Recursos ainda não implementados
 
 O dzImage é um formato próprio de payload LZ4 com tamanho e CRC32, não é
-compatível com `vmlinuz` nem substitui o Limine. Ainda não há descoberta
-abrangente de hardware por ACPI/Device Tree, KMS ou raiz persistente.
+compatível com o protocolo de boot do Linux nem substitui o Limine. Ainda não
+há descoberta abrangente de hardware por ACPI/Device Tree, KMS ou raiz
+persistente.

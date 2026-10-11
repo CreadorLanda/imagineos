@@ -11,6 +11,14 @@ const POLL_LIMIT: usize = 100_000_000;
 const PIT_INPUT_FREQUENCY: u64 = 1_193_182;
 /// Target frequency of the scheduler tick installed by the kernel.
 pub const TIMER_TICK_HZ: u64 = 100;
+/// Quantos ticks cada processo recebe antes de o timer pedir a troca.
+///
+/// Sem isto o processo era preemptado a cada 10 ms, e o custo do switch
+/// (trocar CR3, salvar/restaurar o estado FPU) consumia o pouco tempo útil —
+/// um processo recém-criado por `fork` era interrompido antes de executar a
+/// primeira instrução de usuário e parecia travar. 5 ticks dão 50 ms de
+/// quantum, que é generoso para o modelo cooperativo que este kernel usa.
+pub const TIMER_QUANTUM_TICKS: u64 = 10;
 
 static START_TSC: AtomicU64 = AtomicU64::new(0);
 static TSC_FREQUENCY: AtomicU64 = AtomicU64::new(0);

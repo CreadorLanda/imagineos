@@ -121,6 +121,21 @@ impl<'a> Archive<'a> {
                 return None;
             }
             if path_matches && (header[156] == 0 || header[156] == b'0') {
+                #[cfg(feature = "kernel-debug")]
+                {
+                    crate::serial_log_timestamp();
+                    crate::serial_write(b"find: \"");
+                    crate::serial_write(wanted.as_bytes());
+                    crate::serial_write(b"\" name=\"");
+                    crate::serial_write(name);
+                    crate::serial_write(b"\" prefix=\"");
+                    crate::serial_write(prefix);
+                    crate::serial_write(b"\" type=");
+                    crate::serial_write_number(header[156] as u64);
+                    crate::serial_write(b" size=");
+                    crate::serial_write_number(size as u64);
+                    crate::serial_write(b"\n");
+                }
                 return Some(&self.bytes[data_start..data_end]);
             }
 

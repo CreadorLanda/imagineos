@@ -38,5 +38,13 @@ mod paging {
 
 fn console_write(_message: &str) {}
 
+mod input {
+    pub fn release() {}
+}
+
+mod framebuffer {
+    pub fn set_active(_active: bool) {}
+}
+
 #[path = "../power.rs"]
 mod power;
