@@ -135,7 +135,7 @@ fn write_number(mut value: u64) -> imagineos::Result<()> {
     imagineos::console::write_all(&digits[cursor..])
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn _start(
     _argc: usize,
     _argv: *const *const u8,

@@ -13,33 +13,33 @@ rustup run stable cargo check --target x86_64-unknown-none
 rustup run stable cargo build --release --target x86_64-unknown-none
 rustup run stable cargo test --manifest-path userland/api/Cargo.toml --target x86_64-unknown-linux-gnu
 make user-programs
-rustup run stable rustc --edition 2021 --test kernel/src/fs/ramfs.rs -o /tmp/dreamcore-ramfs-tests
+rustup run stable rustc --edition 2024 --test kernel/src/fs/ramfs.rs -o /tmp/dreamcore-ramfs-tests
 /tmp/dreamcore-ramfs-tests
-rustup run stable rustc --edition 2021 --test kernel/src/exec/elf.rs -o /tmp/dreamcore-elf-tests
+rustup run stable rustc --edition 2024 --test kernel/src/exec/elf.rs -o /tmp/dreamcore-elf-tests
 /tmp/dreamcore-elf-tests
-rustup run stable rustc --edition 2021 --test kernel/src/config.rs -o /tmp/dreamcore-config-tests
+rustup run stable rustc --edition 2024 --test kernel/src/config.rs -o /tmp/dreamcore-config-tests
 /tmp/dreamcore-config-tests
-rustup run stable rustc --edition 2021 --test kernel/src/console/utf8.rs -o /tmp/dreamcore-utf8-tests
+rustup run stable rustc --edition 2024 --test kernel/src/console/utf8.rs -o /tmp/dreamcore-utf8-tests
 /tmp/dreamcore-utf8-tests
-rustup run stable rustc --edition 2021 --test kernel/src/fs/permissions.rs -o /tmp/imagineos-permissions-tests
+rustup run stable rustc --edition 2024 --test kernel/src/fs/permissions.rs -o /tmp/imagineos-permissions-tests
 /tmp/imagineos-permissions-tests
-rustup run stable rustc --edition 2021 --test kernel/src/crypto.rs -o /tmp/imagineos-crypto-tests
+rustup run stable rustc --edition 2024 --test kernel/src/crypto.rs -o /tmp/imagineos-crypto-tests
 /tmp/imagineos-crypto-tests
-rustup run stable rustc --edition 2021 --test kernel/src/tests/keyboard.rs -o /tmp/dreamcore-keyboard-tests
+rustup run stable rustc --edition 2024 --test kernel/src/tests/keyboard.rs -o /tmp/dreamcore-keyboard-tests
 /tmp/dreamcore-keyboard-tests
-rustup run stable rustc --edition 2021 --test kernel/src/tests/storage.rs -o /tmp/imagineos-storage-tests
+rustup run stable rustc --edition 2024 --test kernel/src/tests/storage.rs -o /tmp/imagineos-storage-tests
 /tmp/imagineos-storage-tests
-rustup run stable rustc --edition 2021 --test kernel/src/tests/dfs.rs -o /tmp/imagineos-dfs-tests
+rustup run stable rustc --edition 2024 --test kernel/src/tests/dfs.rs -o /tmp/imagineos-dfs-tests
 /tmp/imagineos-dfs-tests
-rustup run stable rustc --edition 2021 --test kernel/src/tests/installer.rs -o /tmp/imagineos-installer-tests
+rustup run stable rustc --edition 2024 --test kernel/src/tests/installer.rs -o /tmp/imagineos-installer-tests
 /tmp/imagineos-installer-tests
-rustup run stable rustc --edition 2021 --test kernel/src/tests/kernel_log.rs -o /tmp/imagineos-kernel-log-tests
+rustup run stable rustc --edition 2024 --test kernel/src/tests/kernel_log.rs -o /tmp/imagineos-kernel-log-tests
 /tmp/imagineos-kernel-log-tests
-rustup run stable rustc --edition 2021 --test kernel/src/tests/shutdown.rs -o /tmp/imagineos-shutdown-tests
+rustup run stable rustc --edition 2024 --test kernel/src/tests/shutdown.rs -o /tmp/imagineos-shutdown-tests
 /tmp/imagineos-shutdown-tests
-rustup run stable rustc --edition 2021 --test bootstrap/dzimage.rs -o /tmp/imagineos-dzimage-tests
+rustup run stable rustc --edition 2024 --test bootstrap/dzimage.rs -o /tmp/imagineos-dzimage-tests
 /tmp/imagineos-dzimage-tests
-rustup run stable rustc --edition 2021 --test tools/dzpack.rs -o /tmp/imagineos-dzpack-tests
+rustup run stable rustc --edition 2024 --test tools/dzpack.rs -o /tmp/imagineos-dzpack-tests
 /tmp/imagineos-dzpack-tests
 make .build/ramfs.tar
 tar -tf .build/ramfs.tar

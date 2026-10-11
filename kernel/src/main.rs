@@ -73,7 +73,7 @@ mod utf8;
 static LOG_LINE_START: AtomicBool = AtomicBool::new(true);
 static EMBEDDED_FONT: &[u8] = include_bytes!("../../tools/assets/zap-vga16.psf");
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn kernel_entry(boot_info: *const boot_info::BootInfo) -> ! {
     unsafe {
         asm!("cli", options(nomem, nostack));

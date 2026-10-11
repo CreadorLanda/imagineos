@@ -14,7 +14,7 @@ const KEY_HOME: char = '\u{f0004}';
 const KEY_END: char = '\u{f0005}';
 const KEY_DELETE: char = '\u{f0006}';
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn _start(
     argc: usize,
     argv: *const *const u8,

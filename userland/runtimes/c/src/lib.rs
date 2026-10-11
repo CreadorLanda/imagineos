@@ -53,7 +53,7 @@ _start:
     options(att_syntax)
 );
 
-extern "C" {
+unsafe extern "C" {
     fn main(argc: i32, argv: *mut *mut u8) -> i32;
     /// Vetor de ambiente global definido pela libc em C (`stdlib.c`).
     static mut environ: *mut *mut u8;
@@ -68,7 +68,7 @@ extern "C" {
 /// # Safety
 /// Deve ser chamada apenas pelo `_start`, com os vetores `argv`/`envp`
 /// fornecidos pelo kernel e válidos durante toda a execução.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn c_runtime_init(
     argc: i32,
     argv: *mut *mut u8,

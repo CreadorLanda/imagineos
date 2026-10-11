@@ -34,22 +34,22 @@ const PAGE_TABLE_POOL_PAGES: usize = 32;
 const MAX_PROGRAM_HEADERS: usize = 64;
 
 #[used]
-#[link_section = ".requests"]
+#[unsafe(link_section = ".requests")]
 static BASE_REVISION: BaseRevision = BaseRevision::new();
 #[used]
-#[link_section = ".requests"]
+#[unsafe(link_section = ".requests")]
 static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 #[used]
-#[link_section = ".requests"]
+#[unsafe(link_section = ".requests")]
 static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 #[used]
-#[link_section = ".requests"]
+#[unsafe(link_section = ".requests")]
 static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 #[used]
-#[link_section = ".requests"]
+#[unsafe(link_section = ".requests")]
 static MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
 #[used]
-#[link_section = ".requests"]
+#[unsafe(link_section = ".requests")]
 static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 
 static EMBEDDED_FONT: &[u8] = include_bytes!("../tools/assets/zap-vga16.psf");
@@ -136,7 +136,7 @@ impl PageTablePool {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     // This compile using the dzImage bootstrap, which is a custom bootloader that unpacks and loads the ImagineOS kernel 
     // from a compressed dzImage file. It initializes the serial port, framebuffer, and other necessary components before 

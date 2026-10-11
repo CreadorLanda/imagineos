@@ -8,7 +8,7 @@ const CONFIG_PATH: &[u8] = b"/home/.global/global.conf";
 const DEFAULT_CONFIG: &[u8] = b"charset=utf-8\nkeyboard=abnt2\n";
 const MAX_CONFIG_SIZE: usize = 4096;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn _start(
     argc: usize,
     argv: *const *const u8,

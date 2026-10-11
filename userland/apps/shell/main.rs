@@ -34,7 +34,7 @@ use parser::{parse_list, Connector, Entry, ParseError, MAX_ENTRIES};
 /// Comprimento máximo de uma linha de comando digitada.
 const LINE_SIZE: usize = 256;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn _start(
     argc: usize,
     argv: *const *const u8,

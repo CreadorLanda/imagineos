@@ -40,7 +40,7 @@ $(USER_RUNTIME_RLIB): $(USER_RUNTIME_MANIFEST) $(ROOT)/userland/runtimes/rust/sr
 $(BUILD_DIR)/user/sbin/%: $(ROOT)/userland/apps/%.rs $(ROOT)/userland/linker.ld \
                           $(USER_API_RLIB) $(USER_RUNTIME_RLIB)
 	@mkdir -p $(dir $@)
-	$(RUSTC) --crate-name $* --edition 2021 --target $(TARGET) \
+	$(RUSTC) --crate-name $* --edition 2024 --target $(TARGET) \
 		--extern imagineos=$(USER_API_RLIB) --extern imagineos_rt=$(USER_RUNTIME_RLIB) \
 		-L dependency=$(USER_API_DEPS) -L dependency=$(USER_RUNTIME_DEPS) \
 		-C panic=abort -C relocation-model=static \
@@ -53,7 +53,7 @@ SHELL_SOURCES := $(wildcard $(ROOT)/userland/apps/shell/*.rs)
 $(BUILD_DIR)/user/bin/shell: $(filter-out %/tests.rs,$(SHELL_SOURCES)) $(ROOT)/userland/linker.ld \
                              $(USER_API_RLIB) $(USER_RUNTIME_RLIB)
 	@mkdir -p $(dir $@)
-	$(RUSTC) --crate-name shell --edition 2021 --target $(TARGET) \
+	$(RUSTC) --crate-name shell --edition 2024 --target $(TARGET) \
 	--extern imagineos=$(USER_API_RLIB) --extern imagineos_rt=$(USER_RUNTIME_RLIB) \
 	-L dependency=$(USER_API_DEPS) -L dependency=$(USER_RUNTIME_DEPS) \
 	-C panic=abort -C relocation-model=static \
@@ -68,7 +68,7 @@ $(BUILD_DIR)/user/sbin/horust: $(filter-out %/tests.rs,$(HORUST_SOURCES)) \
                                $(ROOT)/userland/apps/horust-lite.rs \
                                $(ROOT)/userland/linker.ld $(USER_API_RLIB) $(USER_RUNTIME_RLIB)
 	@mkdir -p $(dir $@)
-	$(RUSTC) --crate-name horust --edition 2021 --target $(TARGET) \
+	$(RUSTC) --crate-name horust --edition 2024 --target $(TARGET) \
 	--extern imagineos=$(USER_API_RLIB) --extern imagineos_rt=$(USER_RUNTIME_RLIB) \
 	-L dependency=$(USER_API_DEPS) -L dependency=$(USER_RUNTIME_DEPS) \
 	-C panic=abort -C relocation-model=static \
@@ -81,7 +81,7 @@ DISPLAY_SOURCES := $(wildcard $(ROOT)/userland/apps/display/*.rs)
 $(BUILD_DIR)/user/utilities/display: $(DISPLAY_SOURCES) $(ROOT)/userland/linker.ld \
                                     $(USER_API_RLIB) $(USER_RUNTIME_RLIB)
 	@mkdir -p $(dir $@)
-	$(RUSTC) --crate-name display --edition 2021 --target $(TARGET) \
+	$(RUSTC) --crate-name display --edition 2024 --target $(TARGET) \
 	--extern imagineos=$(USER_API_RLIB) --extern imagineos_rt=$(USER_RUNTIME_RLIB) \
 	-L dependency=$(USER_API_DEPS) -L dependency=$(USER_RUNTIME_DEPS) \
 	-C panic=abort -C relocation-model=static \
@@ -98,7 +98,7 @@ EDE_PROGRAMS := $(patsubst $(ROOT)/userland/apps/ede/%.rs,$(BUILD_DIR)/user/bin/
 $(BUILD_DIR)/user/bin/ede-%: $(ROOT)/userland/apps/ede/%.rs $(ROOT)/userland/linker.ld \
                              $(USER_API_RLIB) $(USER_RUNTIME_RLIB)
 	@mkdir -p $(dir $@)
-	$(RUSTC) --crate-name ede$(subst -,_,$*) --edition 2021 --target $(TARGET) \
+	$(RUSTC) --crate-name ede$(subst -,_,$*) --edition 2024 --target $(TARGET) \
 	--extern imagineos=$(USER_API_RLIB) --extern imagineos_rt=$(USER_RUNTIME_RLIB) \
 	-L dependency=$(USER_API_DEPS) -L dependency=$(USER_RUNTIME_DEPS) \
 	-C panic=abort -C relocation-model=static \
@@ -107,7 +107,7 @@ $(BUILD_DIR)/user/bin/ede-%: $(ROOT)/userland/apps/ede/%.rs $(ROOT)/userland/lin
 $(BUILD_DIR)/user/bin/%: $(ROOT)/userland/apps/%.rs $(ROOT)/userland/linker.ld \
                          $(USER_API_RLIB) $(USER_RUNTIME_RLIB)
 	@mkdir -p $(dir $@)
-	$(RUSTC) --crate-name $(subst -,_,$*) --edition 2021 --target $(TARGET) \
+	$(RUSTC) --crate-name $(subst -,_,$*) --edition 2024 --target $(TARGET) \
 		--extern imagineos=$(USER_API_RLIB) --extern imagineos_rt=$(USER_RUNTIME_RLIB) \
 		-L dependency=$(USER_API_DEPS) -L dependency=$(USER_RUNTIME_DEPS) \
 		-C panic=abort -C relocation-model=static \
@@ -117,7 +117,7 @@ $(BUILD_DIR)/user/bin/%: $(ROOT)/userland/apps/%.rs $(ROOT)/userland/linker.ld \
 $(BUILD_DIR)/user/utilities/%: $(ROOT)/userland/utilities/%.rs $(ROOT)/userland/utilities/common.rs \
                                $(ROOT)/userland/linker.ld $(USER_API_RLIB) $(USER_RUNTIME_RLIB)
 	@mkdir -p $(dir $@)
-	$(RUSTC) --crate-name $* --edition 2021 --target $(TARGET) \
+	$(RUSTC) --crate-name $* --edition 2024 --target $(TARGET) \
 		--extern imagineos=$(USER_API_RLIB) --extern imagineos_rt=$(USER_RUNTIME_RLIB) \
 		-L dependency=$(USER_API_DEPS) -L dependency=$(USER_RUNTIME_DEPS) \
 		-C panic=abort -C relocation-model=static \

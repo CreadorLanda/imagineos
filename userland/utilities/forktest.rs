@@ -8,7 +8,7 @@
 
 mod common;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn _start(
     _argc: usize,
     _argv: *const *const u8,

@@ -104,15 +104,14 @@ pub fn poll() -> Option<MouseReport> {
             // correto.
             let signed_x = decode_delta(PACKET[1], flags & 0x10 != 0);
             let signed_y = decode_delta(PACKET[2], flags & 0x20 != 0);
-            // Convenção PS/2 padrão: delta_x positivo = movimento para a
-            // direita, delta_y positivo = movimento para baixo — exatamente a
-            // orientação de tela. Nenhuma inversão é necessária; negar aqui
-            // fazia o cursor andar ao contrário do mouse.
+            // Convenção PS/2: delta_y positivo = mouse para baixo, mas a
+            // origem Y da tela é o topo, então invertemos o sinal para que
+            // mover o mouse para baixo mova o cursor para baixo.
             if !overflow_x {
                 accumulated_x += signed_x;
             }
             if !overflow_y {
-                accumulated_y += signed_y;
+                accumulated_y -= signed_y;
             }
             left = flags & 0x01 != 0;
             right = flags & 0x02 != 0;

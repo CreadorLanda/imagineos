@@ -1,7 +1,7 @@
 [package]
 name = "dreamcore"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [workspace]
 members = ["shared/abi", "userland/api", "userland/runtimes/rust", "userland/runtimes/c"]

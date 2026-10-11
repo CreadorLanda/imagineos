@@ -153,7 +153,7 @@ pub fn print(arguments: fmt::Arguments<'_>) -> Result<()> {
 #[macro_export]
 macro_rules! main {
     ($entry:path) => {
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         extern "C" fn _start(
             _argc: usize,
             _argv: *const *const u8,
@@ -169,7 +169,7 @@ macro_rules! main {
         }
     };
     (with_args $entry:path) => {
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         extern "C" fn _start(
             argc: usize,
             argv: *const *const u8,

@@ -179,7 +179,7 @@ dreamcore_resume_trap_frame:
 "#
 );
 
-extern "C" {
+unsafe extern "C" {
     fn dreamcore_exception_0();
     fn dreamcore_exception_1();
     fn dreamcore_exception_2();
@@ -220,13 +220,13 @@ extern "C" {
 /// Entry point for the periodic PIT interrupt (IRQ0). It preserves the interrupted
 /// trap frame, hands control to the scheduler for possible preemption, then returns
 /// the frame to resume on top of the iretq instruction.
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn dreamcore_timer_dispatch(frame: *mut crate::syscall::TrapFrame) -> *mut crate::syscall::TrapFrame {
     crate::arch::x86_64::timer::handle_interrupt(frame)
 }
 
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn dreamcore_exception_handler(
     vector: u64,
     error: u64,

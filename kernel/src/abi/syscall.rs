@@ -54,7 +54,7 @@ pub struct TrapFrame {
     pub ss: u64,
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn dreamcore_syscall_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
     // Preserva os registradores FPU/SSE do processo que fez a syscall: o kernel
     // Rust pode usar XMM entre aqui e o retorno para o espaço de usuário.

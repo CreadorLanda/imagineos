@@ -23,7 +23,7 @@ const COLOR_BAR: u32 = 0x0b1118;
 const COLOR_ACCENT: u32 = 0x1f6f78;
 const COLOR_TEXT: u32 = 0xe8edf2;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn _start(
     _argc: usize,
     _argv: *const *const u8,

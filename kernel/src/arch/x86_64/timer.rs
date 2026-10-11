@@ -14,7 +14,7 @@ use crate::syscall::TrapFrame;
 /// eligible, the scheduler switches address spaces and returns a different
 /// frame, otherwise it returns `frame` unchanged so the interrupted process
 /// continues transparently.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn handle_interrupt(frame: *mut TrapFrame) -> *mut TrapFrame {
     crate::time::note_timer_tick();
     // The end-of-interrupt is sent to the master PIC so further IRQ0 (and any
