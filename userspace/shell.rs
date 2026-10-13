@@ -136,6 +136,7 @@ impl ShellState {
 }
 
 #[derive(Clone, Copy)]
+#[repr(C)]
 #[allow(dead_code)]
 struct UserArg {
     address: u64,
@@ -369,13 +370,19 @@ fn normalize_path(state: &ShellState, path: &[u8], output: &mut [u8; TOKEN_SIZE]
     } else if path.starts_with(b"~/") {
         let home = state.get_variable(b"HOME").unwrap_or(b"/");
         let mut length = home.len();
+        if length > input.len() {
+            return None;
+        }
         input[..length].copy_from_slice(home);
         if length > 1 && input[length - 1] == b'/' {
             length -= 1;
         }
+        let suffix = &path[2..];
+        if length + 1 + suffix.len() > input.len() {
+            return None;
+        }
         input[length] = b'/';
         length += 1;
-        let suffix = &path[2..];
         input[length..length + suffix.len()].copy_from_slice(suffix);
         &input[..length + suffix.len()]
     } else {
@@ -650,10 +657,16 @@ fn find_external(
 }
 
 fn join_path(directory: &[u8], command: &[u8], output: &mut [u8; TOKEN_SIZE]) -> Option<usize> {
+    if directory.len() > output.len() {
+        return None;
+    }
     let mut length = 0usize;
     output[..directory.len()].copy_from_slice(directory);
     length += directory.len();
     if length == 0 || output[length - 1] != b'/' {
+        if length >= output.len() {
+            return None;
+        }
         output[length] = b'/';
         length += 1;
     }

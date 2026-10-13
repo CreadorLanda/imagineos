@@ -189,7 +189,9 @@ fn load_elf(
             rax: 0,
             rip: elf.entry,
             cs: gdt::USER_CODE_SELECTOR,
-            rflags: 0x2,
+            // Bit 1 (reserved, always 1) + bit 9 (IF) so ring 3 starts
+            // with maskable interrupts enabled. 0x2 alone leaves IF=0.
+            rflags: 0x202,
             rsp: user_stack,
             ss: gdt::USER_DATA_SELECTOR,
             rdi: arguments.len() as u64,
