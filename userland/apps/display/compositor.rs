@@ -8,10 +8,12 @@ use imagineos::display::{self, Framebuffer};
 use imagineos::process;
 
 use crate::apps;
-use crate::theme;
-use crate::window::{Window, MAX_HEIGHT, MAX_WIDTH, TITLE_HEIGHT};
+use crate::theme::{self, Theme};
+use crate::window::{Window, MAX_HEIGHT, MAX_WIDTH};
 
 pub const MAX_WINDOWS: usize = 4;
+/// Altura dos glifos da fonte bitmap compartilhada (8x8).
+const FONT_GLYPH_HEIGHT: usize = 8;
 /// Superfícies externas (clientes via protocolo de superfícies).
 const MAX_EXTERNAL: usize = imagineos::abi::MAX_SURFACES;
 const WINDOW_PIXELS: usize = MAX_WIDTH * MAX_HEIGHT;
@@ -52,6 +54,67 @@ pub struct Compositor {
     /// produz a piscada que fazia o servidor congelar após alguns segundos.
     dirty: bool,
     frame_number: u32,
+    /// Tema carregado de `system/themes/default.theme` (cores, cursor e
+    /// sprites de janela). Sem o disco, os padrões embutidos valem.
+    theme: Theme,
+    /// Retângulo ocupado pelo cursor no último quadro apresentado. Movimentos
+    /// do ponteiro restauram só essa área no backbuffer e blitam apenas os
+    /// scanlines afetados — recompor a tela inteira a cada pacote do mouse
+    /// (4 MiB de escritas voláteis) era a causa do "lag" do cursor.
+    cursor_rect: Rect,
+    /// Verdadeiro quando `cursor_rect` ainda contém o cursor desenhado no
+    /// backbuffer (o fundo salvo está atrás dele).
+    cursor_present: bool,
+    /// Movimento do ponteiro pendente (cursor precisa ser redesenhado sem
+    /// recomposição completa).
+    cursor_dirty: bool,
+    /// Cópia do fundo por baixo do cursor desenhado (tamanho máximo do
+    /// sprite: MAX_CURSOR_WIDTH x MAX_CURSOR_HEIGHT).
+    cursor_saved: [u32; theme::MAX_CURSOR_WIDTH * theme::MAX_CURSOR_HEIGHT],
+}
+
+/// Retângulo de tela inclusive/exclusive, para atualizações parciais.
+#[derive(Clone, Copy, Default)]
+struct Rect {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+impl Rect {
+    fn empty() -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.width <= 0 || self.height <= 0
+    }
+
+    /// União conservadora de dois retângulos (para acumular dano).
+    fn union(&self, other: &Rect) -> Rect {
+        if self.is_empty() {
+            return *other;
+        }
+        if other.is_empty() {
+            return *self;
+        }
+        let left = self.x.min(other.x);
+        let top = self.y.min(other.y);
+        let right = (self.x + self.width).max(other.x + other.width);
+        let bottom = (self.y + self.height).max(other.y + other.height);
+        Rect {
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top,
+        }
+    }
 }
 
 /// Uma janela de um processo externo, composta pelo display server.
@@ -87,7 +150,18 @@ impl Compositor {
             external_count: 0,
             dirty: true,
             frame_number: 0,
+            theme: Theme::builtin(),
+            cursor_rect: Rect::empty(),
+            cursor_present: false,
+            cursor_dirty: false,
+            cursor_saved: [0; theme::MAX_CURSOR_WIDTH * theme::MAX_CURSOR_HEIGHT],
         }
+    }
+
+    /// Carrega o tema do disco (CSS, cursor e sprites). Chamado uma vez
+    /// depois de mapear a tela; falhas degradam para os padrões embutidos.
+    pub fn load_theme(&mut self) {
+        self.theme = Theme::load();
     }
 
     pub fn spawn_demo_windows(&mut self) {
@@ -100,8 +174,8 @@ impl Compositor {
             42,
             260,
             150,
-            theme::WINDOW,
-            theme::TEXT,
+            self.theme.window.window,
+            self.theme.window.desktop_accent,
             apps::draw_terminal,
         );
         self.add_window(
@@ -110,8 +184,8 @@ impl Compositor {
             390,
             194,
             108,
-            theme::WINDOW_ALT,
-            theme::TEXT,
+            self.theme.window.window_alt,
+            self.theme.window.desktop_accent,
             apps::draw_monitor,
         );
     }
@@ -132,7 +206,18 @@ impl Compositor {
         }
         let slot = self.count;
         let canvas = unsafe { core::ptr::addr_of_mut!(CANVASES[slot]).cast::<u32>() };
-        let mut window = Window::new(title, x, y, width, height, background, foreground, canvas);
+        let mut window = Window::new(
+            title,
+            x,
+            y,
+            width,
+            height,
+            background,
+            foreground,
+            canvas,
+            self.theme.window.border,
+            self.theme.window.title_height,
+        );
         window.z = slot as u32;
         draw(&mut window);
         self.windows[slot] = Some(window);
@@ -150,11 +235,81 @@ impl Compositor {
             if self.dirty {
                 self.compose();
                 self.dirty = false;
+            } else if self.cursor_dirty {
+                // Movimento de ponteiro sem outra mudança: em vez de recompor
+                // a tela inteira (varredura de 1024x768 no backbuffer e cópia
+                // de 3 MiB para o framebuffer), restaura apenas o retângulo
+                // antigo do cursor, redesenha o cursor e bl os scanlines
+                // afetados. É o caminho quente do WM — o cursor segue o mouse
+                // com o custo de ~50 scanlines em vez de 768.
+                self.update_cursor_only();
+                self.cursor_dirty = false;
             }
             self.frame_number = self.frame_number.wrapping_add(1);
             if process::yield_now().is_err() {
                 process::exit(1);
             }
+        }
+    }
+
+    /// Atualiza só o cursor no backbuffer + framebuffer.
+    fn update_cursor_only(&mut self) {
+        if !self.cursor_present {
+            self.compose();
+            return;
+        }
+        // 1) Restaura o fundo salvo por baixo do cursor antigo.
+        let saved = self.cursor_saved;
+        let old = self.cursor_rect;
+        if !old.is_empty() {
+            self.blit_saved(&saved, &old);
+        }
+        // 2) Desenha o cursor na posição nova e salva o fundo por baixo.
+        self.draw_cursor_and_save();
+        // 3) Blita os scanlines da união dos dois retângulos no framebuffer.
+        let damage = old.union(&self.cursor_rect);
+        self.present_rect(&damage);
+    }
+
+    /// Restaura pixels de um backup (linha a linha, pitch do backup = largura
+    /// do retângulo) para o backbuffer.
+    fn blit_saved(&self, saved: &[u32], rect: &Rect) {
+        if rect.is_empty() {
+            return;
+        }
+        let width = rect.width as usize;
+        for row in 0..rect.height as usize {
+            for column in 0..width {
+                let value = saved[row * width + column];
+                let index = (rect.y as usize + row) * self.screen_pitch
+                    + rect.x as usize
+                    + column;
+                unsafe { self.backbuffer.add(index).write(value) };
+            }
+        }
+    }
+
+    /// Copia do backbuffer para o framebuffer apenas as scanlines de `rect`.
+    fn present_rect(&self, rect: &Rect) {
+        if rect.is_empty() {
+            return;
+        }
+        let screen_width = self.framebuffer.width() as i32;
+        let screen_height = self.framebuffer.height() as i32;
+        let left = rect.x.max(0);
+        let top = rect.y.max(0);
+        let right = (rect.x + rect.width).min(screen_width);
+        let bottom = (rect.y + rect.height).min(screen_height);
+        if left >= right || top >= bottom {
+            return;
+        }
+        for row in top..bottom {
+            let index = row as usize * self.screen_pitch + left as usize;
+            let count = (right - left) as usize;
+            let line = unsafe {
+                core::slice::from_raw_parts(self.backbuffer.add(index), count)
+            };
+            self.framebuffer.copy_row(line, left as usize, row as usize);
         }
     }
 
@@ -286,7 +441,9 @@ impl Compositor {
                     self.pointer_x = event.x;
                     self.pointer_y = event.y;
                     if moved {
-                        self.dirty = true;
+                        // Só o cursor mudou: atualização por região suja, sem
+                        // recompor as janelas.
+                        self.cursor_dirty = true;
                     }
                     // Encaminha movimento à superfície externa sob o cursor.
                     if let Some(surface) = self.external_at(self.pointer_x, self.pointer_y) {
@@ -383,7 +540,7 @@ impl Compositor {
     }
 
     fn compose(&mut self) {
-        let background = self.framebuffer.color(theme::DESKTOP);
+        let background = self.framebuffer.color(self.theme.window.desktop);
         self.screen_fill(
             0,
             0,
@@ -423,21 +580,21 @@ impl Compositor {
         for entry in self.external[..self.external_count].iter().flatten() {
             self.draw_external(entry);
         }
-        self.draw_cursor();
+        self.draw_cursor_and_save();
         // Presenta uma única imagem composta, em vez de limpar e redesenhar a
         // tela diretamente. Isso elimina o flash do desktop entre janelas.
-        let screen = unsafe {
-            core::slice::from_raw_parts(
-                self.backbuffer,
-                self.screen_pitch * self.framebuffer.height(),
-            )
-        };
-        self.framebuffer.copy_from(screen, self.screen_pitch);
+        self.present_rect(&Rect {
+            x: 0,
+            y: 0,
+            width: self.framebuffer.width() as i32,
+            height: self.framebuffer.height() as i32,
+        });
+        self.cursor_present = true;
     }
 
     fn draw_desktop_bar(&self) {
-        let bar = self.framebuffer.color(theme::BORDER_COLOR);
-        let accent = self.framebuffer.color(theme::DESKTOP_ACCENT);
+        let bar = self.framebuffer.color(self.theme.window.border_color);
+        let accent = self.framebuffer.color(self.theme.window.desktop_accent);
         let width = self.framebuffer.width() as i32;
         self.screen_fill(0, 0, width, 24, bar);
         self.screen_fill(0, 23, width, 1, accent);
@@ -446,36 +603,37 @@ impl Compositor {
     }
 
     fn draw_window(&self, window: &Window, focused: bool) {
-        let border = self.framebuffer.color(theme::BORDER_COLOR);
+        let window_theme = &self.theme.window;
+        let border = self.framebuffer.color(window_theme.border_color);
         let title = self.framebuffer.color(if focused {
-            theme::TITLE_ACTIVE
+            window_theme.title_active
         } else {
-            theme::TITLE_INACTIVE
+            window_theme.title_inactive
         });
-        let title_text = self.framebuffer.color(theme::TITLE_TEXT);
-        let content_x = window.x + theme::BORDER;
-        let content_y = window.y + TITLE_HEIGHT;
-        let outer_width = window.width + 2 * theme::BORDER;
-        let outer_height = window.height + TITLE_HEIGHT + theme::BORDER;
+        let title_text = self.framebuffer.color(window_theme.title_text);
+        let content_x = window.x + window.border;
+        let content_y = window.y + window.title_height;
+        let outer_width = window.width + 2 * window.border;
+        let outer_height = window.height + window.title_height + window.border;
 
         self.screen_fill(window.x, window.y, outer_width, outer_height, border);
-        self.screen_fill(content_x, window.y, window.width, TITLE_HEIGHT, title);
+        self.screen_fill(content_x, window.y, window.width, window.title_height, title);
 
         // Botões fechar/minimizar — decoração visual neste protótipo.
-        let button = theme::TITLE_BUTTON_SIZE;
+        let button = window_theme.button_size;
         self.screen_fill(
             window.x + outer_width - button - 3,
-            window.y + (TITLE_HEIGHT - button) / 2,
+            window.y + (window.title_height - button) / 2,
             button,
             button,
-            self.framebuffer.color(theme::BUTTON_CLOSE),
+            self.framebuffer.color(window_theme.button_close),
         );
         self.screen_fill(
             window.x + outer_width - button * 2 - 7,
-            window.y + (TITLE_HEIGHT - button) / 2,
+            window.y + (window.title_height - button) / 2,
             button,
             button,
-            self.framebuffer.color(theme::BUTTON_MINIMIZE),
+            self.framebuffer.color(window_theme.button_minimize),
         );
 
         for row in 0..window.height as usize {
@@ -485,12 +643,11 @@ impl Compositor {
                 self.screen_pixel(content_x + column as i32, content_y + row as i32, pixel);
             }
         }
-        // Título com a fonte bitmap do tema (desenhado no framebuffer, sem
-        // depender do console de texto do kernel).
+        // Título com a fonte bitmap (desenhado no backbuffer).
         draw_text(
             self,
             content_x + 8,
-            window.y + (TITLE_HEIGHT - theme::GLYPH_HEIGHT as i32) / 2,
+            window.y + (window.title_height - FONT_GLYPH_HEIGHT as i32) / 2,
             window.title(),
             title_text,
         );
@@ -536,36 +693,69 @@ impl Compositor {
         }
     }
 
-    fn draw_cursor(&self) {
-        let outline = self.framebuffer.color(theme::CURSOR_OUTLINE);
-        let white = self.framebuffer.color(theme::CURSOR_COLOR);
-        // Ponteiro em seta pequena, desenhado diretamente no framebuffer.
-        for row in 0..theme::CURSOR_SIZE {
-            let width = (row / 2 + 1).min(theme::CURSOR_SIZE - row / 2);
-            for column in 0..width {
+    /// Desenha o cursor na posição atual e salva o fundo por baixo dele.
+    ///
+    /// A seta é desenhada com primitivas (pixels), nas cores do CSS
+    /// (`#cursor { background-color; color }`). O fundo salvo permite que um
+    /// movimento do ponteiro restaure apenas o retângulo antigo — é o que
+    /// tira o "lag" do cursor sem recompor a tela.
+    fn draw_cursor_and_save(&mut self) {
+        let window_theme = &self.theme.window;
+        let screen_width = self.framebuffer.width() as i32;
+        let screen_height = self.framebuffer.height() as i32;
+        let size = window_theme.cursor_size;
+        // Recorta o retângulo na tela e salva o fundo.
+        let left = self.pointer_x.max(0);
+        let top = self.pointer_y.max(0);
+        let right = (self.pointer_x + size).min(screen_width);
+        let bottom = (self.pointer_y + size).min(screen_height);
+        if left < right && top < bottom {
+            for row in top..bottom {
+                for column in left..right {
+                    let index = row as usize * self.screen_pitch + column as usize;
+                    let value = unsafe { self.backbuffer.add(index).read() };
+                    let slot_row = (row - top) as usize;
+                    let slot_column = (column - left) as usize;
+                    self.cursor_saved[slot_row * theme::MAX_CURSOR_WIDTH + slot_column] = value;
+                }
+            }
+        }
+        self.cursor_rect = Rect {
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top,
+        };
+        // Seta clássica: contorno escuro no perímetro, corpo claro no miolo.
+        let outline = self.framebuffer.color(window_theme.cursor_outline);
+        let body = self.framebuffer.color(window_theme.cursor_color);
+        for row in 0..size {
+            let line_width = (row / 2 + 1).min(size - row / 2);
+            for column in 0..line_width {
                 self.screen_pixel(self.pointer_x + column, self.pointer_y + row, outline);
             }
         }
-        for row in 1..theme::CURSOR_SIZE - 2 {
-            let width = (row / 2).max(1);
-            for column in 0..width {
-                self.screen_pixel(self.pointer_x + column, self.pointer_y + row, white);
+        for row in 1..size - 2 {
+            let line_width = (row / 2).max(1);
+            for column in 0..line_width {
+                self.screen_pixel(self.pointer_x + column, self.pointer_y + row, body);
             }
         }
+        self.cursor_present = true;
     }
 }
-
-/// Desenha texto no framebuffer usando a tabela de glifos 8x8.
+/// Desenha texto no backbuffer usando a fonte bitmap 8x8 compartilhada
+/// (crate `imagineos`), igual à dos clientes de superfície.
 fn draw_text(compositor: &Compositor, mut x: i32, y: i32, text: &str, color: u32) {
     for character in text.chars() {
-        let bitmap = theme::glyph(character);
+        let bitmap = imagineos::font::glyph(character);
         for (row, bits) in bitmap.iter().enumerate() {
-            for column in 0..theme::GLYPH_WIDTH {
+            for column in 0..8 {
                 if bits & (0x80 >> column) != 0 {
                     compositor.screen_pixel(x + column as i32, y + row as i32, color);
                 }
             }
         }
-        x += theme::GLYPH_WIDTH as i32 + 1;
+        x += 8 + 1;
     }
 }

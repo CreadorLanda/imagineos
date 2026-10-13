@@ -48,6 +48,9 @@ extern "C" fn _start(
     }
 
     let mut compositor = Compositor::new(framebuffer);
+    // O tema define cores, cursor e sprites de janela; sem o arquivo, valem
+    // os padrões embutidos.
+    compositor.load_theme();
     compositor.spawn_demo_windows();
     compositor.run()
 }

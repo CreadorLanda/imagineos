@@ -99,6 +99,26 @@ impl Framebuffer {
         }
     }
 
+    /// Copia uma linha contígua do backbuffer para o framebuffer. Usado pelo
+    /// compositor para apresentar apenas as regiões sujas (movimento de
+    /// cursor), sem reescrever a tela inteira.
+    pub fn copy_row(&self, source: &[u32], column: usize, row: usize) {
+        if row >= self.height {
+            return;
+        }
+        for (index, &pixel) in source.iter().enumerate() {
+            if column + index >= self.width {
+                break;
+            }
+            unsafe {
+                core::ptr::write_volatile(
+                    self.address.add(row * self.pitch_words + column + index),
+                    pixel,
+                );
+            }
+        }
+    }
+
     /// Moldura de um retângulo, útil para desenhar bordas de janela.
     pub fn outline(&self, x: i32, y: i32, width: i32, height: i32, thickness: i32, color: u32) {
         self.fill(x, y, width, thickness, color);

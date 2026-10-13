@@ -4,14 +4,9 @@
 //! a tela. Esse desenho em dois passos é o que permite mover ou sobrepor
 //! janelas sem que cada aplicação precise redesenhar.
 
-use crate::theme;
-
 /// Tamanho máximo de uma janela, em pixels.
 pub const MAX_WIDTH: usize = 320;
 pub const MAX_HEIGHT: usize = 200;
-
-/// Altura do painel de título, em pixels.
-pub const TITLE_HEIGHT: i32 = theme::TITLE_HEIGHT;
 
 /// Uma janela com posição, tamanho e buffer próprios.
 pub struct Window {
@@ -31,6 +26,10 @@ pub struct Window {
     pub foreground: u32,
     /// Ordem de empilhamento: maior = mais à frente.
     pub z: u32,
+    /// Espessura da moldura (tema: `#border { border-width: Npx }`).
+    pub border: i32,
+    /// Altura da barra de título (tema: `#titlebar { height: Npx }`).
+    pub title_height: i32,
 }
 
 impl Window {
@@ -45,6 +44,8 @@ impl Window {
         background: u32,
         foreground: u32,
         canvas: *mut u32,
+        border: i32,
+        title_height: i32,
     ) -> Self {
         let mut title_bytes = [0u8; 32];
         let length = title.len().min(title_bytes.len());
@@ -72,6 +73,8 @@ impl Window {
             background,
             foreground,
             z: 0,
+            border: border.max(0),
+            title_height: title_height.max(1),
         }
     }
 
@@ -124,34 +127,38 @@ impl Window {
         self.fill(x + width - thickness, y, thickness, height, color);
     }
 
-    /// Escreve texto usando a fonte de 8x8 do compositor.
+    /// Escreve texto usando a fonte de 8x8 compartilhada.
     pub fn text(&mut self, x: i32, y: i32, text: &str, color: u32) {
+        const GLYPH_WIDTH: usize = 8;
+        const GLYPH_HEIGHT: usize = 8;
         let origin_x = x;
         let mut cursor_x = x;
         let mut cursor_y = y;
         for character in text.chars() {
             if character == '\n' {
                 cursor_x = origin_x;
-                cursor_y += theme::GLYPH_HEIGHT as i32 + 2;
+                cursor_y += GLYPH_HEIGHT as i32 + 2;
                 continue;
             }
-            if cursor_x + theme::GLYPH_WIDTH as i32 > self.width {
+            if cursor_x + GLYPH_WIDTH as i32 > self.width {
                 cursor_x = origin_x;
-                cursor_y += theme::GLYPH_HEIGHT as i32 + 2;
+                cursor_y += GLYPH_HEIGHT as i32 + 2;
             }
-            if cursor_y + theme::GLYPH_HEIGHT as i32 > self.height {
+            if cursor_y + GLYPH_HEIGHT as i32 > self.height {
                 break;
             }
             self.glyph(cursor_x, cursor_y, character, color);
-            cursor_x += theme::GLYPH_WIDTH as i32 + 1;
+            cursor_x += GLYPH_WIDTH as i32 + 1;
         }
     }
 
-    /// Desenha um caractere a partir da tabela de glifos de `theme`.
+    /// Desenha um caractere a partir da tabela de glifos compartilhada.
     fn glyph(&mut self, x: i32, y: i32, character: char, color: u32) {
-        let bitmap = theme::glyph(character);
+        const GLYPH_WIDTH: usize = 8;
+        const GLYPH_HEIGHT: usize = 8;
+        let bitmap = imagineos::font::glyph(character);
         for (row, bits) in bitmap.iter().enumerate() {
-            for column in 0..theme::GLYPH_WIDTH {
+            for column in 0..GLYPH_WIDTH {
                 if bits & (0x80 >> column) != 0 {
                     self.pixel(x + column as i32, y + row as i32, color);
                 }
@@ -162,23 +169,23 @@ impl Window {
     /// O ponteiro está sobre o painel de título desta janela?
     pub fn holds_title(&self, x: i32, y: i32) -> bool {
         x >= self.x
-            && x < self.x + self.width + 2 * theme::BORDER
+            && x < self.x + self.width + 2 * self.border
             && y >= self.y
-            && y < self.y + TITLE_HEIGHT
+            && y < self.y + self.title_height
     }
 
     /// O ponteiro está em qualquer parte desta janela?
     pub fn contains(&self, x: i32, y: i32) -> bool {
         x >= self.x
-            && x < self.x + self.width + 2 * theme::BORDER
+            && x < self.x + self.width + 2 * self.border
             && y >= self.y
-            && y < self.y + self.height + TITLE_HEIGHT + theme::BORDER
+            && y < self.y + self.height + self.title_height + self.border
     }
 
     /// Move a janela, mantendo-a visível nas dimensões da tela.
     pub fn move_to(&mut self, x: i32, y: i32, screen_width: i32, screen_height: i32) {
-        let width = self.width + 2 * theme::BORDER;
-        let height = self.height + TITLE_HEIGHT + theme::BORDER;
+        let width = self.width + 2 * self.border;
+        let height = self.height + self.title_height + self.border;
         self.x = x.clamp(0, (screen_width - width).max(0));
         self.y = y.clamp(0, (screen_height - height).max(0));
     }
