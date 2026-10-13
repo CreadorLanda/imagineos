@@ -84,7 +84,13 @@ extern "C" fn dreamcore_syscall_dispatch(frame: *mut TrapFrame) -> *mut TrapFram
             frame
         }
         SYS_EXEC => {
-            let length = (frame_ref.rsi as usize).min(128);
+            // Do not silently truncate: an overlong path would execute the
+            // wrong file. Report -ENAMETOOLONG like copy_user_path does.
+            if frame_ref.rsi as usize > 128 {
+                frame_ref.rax = (-36i64) as u64;
+                return frame;
+            }
+            let length = frame_ref.rsi as usize;
             let mut path = [0u8; 128];
             if !process::copy_from_current_user(frame_ref.rdi, &mut path[..length]) {
                 frame_ref.rax = (-14i64) as u64;
@@ -182,7 +188,11 @@ extern "C" fn dreamcore_syscall_dispatch(frame: *mut TrapFrame) -> *mut TrapFram
             )
         }
         SYS_ISDIR => {
-            let length = (frame_ref.rsi as usize).min(128);
+            if frame_ref.rsi as usize > 128 {
+                frame_ref.rax = (-36i64) as u64;
+                return frame;
+            }
+            let length = frame_ref.rsi as usize;
             let mut path = [0u8; 128];
             if !process::copy_from_current_user(frame_ref.rdi, &mut path[..length]) {
                 frame_ref.rax = (-14i64) as u64;
@@ -196,7 +206,11 @@ extern "C" fn dreamcore_syscall_dispatch(frame: *mut TrapFrame) -> *mut TrapFram
             frame
         }
         SYS_ISFILE => {
-            let length = (frame_ref.rsi as usize).min(128);
+            if frame_ref.rsi as usize > 128 {
+                frame_ref.rax = (-36i64) as u64;
+                return frame;
+            }
+            let length = frame_ref.rsi as usize;
             let mut path = [0u8; 128];
             if !process::copy_from_current_user(frame_ref.rdi, &mut path[..length]) {
                 frame_ref.rax = (-14i64) as u64;
@@ -210,7 +224,11 @@ extern "C" fn dreamcore_syscall_dispatch(frame: *mut TrapFrame) -> *mut TrapFram
             frame
         }
         SYS_READ_FILE | SYS_READDIR => {
-            let path_length = (frame_ref.rsi as usize).min(128);
+            if frame_ref.rsi as usize > 128 {
+                frame_ref.rax = (-36i64) as u64;
+                return frame;
+            }
+            let path_length = frame_ref.rsi as usize;
             let capacity = (frame_ref.r10 as usize).min(4096);
             let mut path = [0u8; 128];
             if !process::copy_from_current_user(frame_ref.rdi, &mut path[..path_length]) {
@@ -270,7 +288,9 @@ extern "C" fn dreamcore_syscall_dispatch(frame: *mut TrapFrame) -> *mut TrapFram
             frame
         }
         _ => {
-            frame_ref.rax = u64::MAX;
+            // Unknown syscall number: -ENOSYS, matching the negative-errno
+            // convention used by every other arm (-2, -14, -22, ...).
+            frame_ref.rax = (-38i64) as u64;
             frame
         }
     }

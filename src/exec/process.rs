@@ -145,11 +145,8 @@ fn load_elf(
         }
 
         zero_user_range(&address_space, segment.virtual_address, segment.memory_size)?;
-        copy_to_user(
-            &address_space,
-            segment.virtual_address,
-            elf.file_bytes(segment),
-        )?;
+        let file_bytes = elf.file_bytes(segment).ok_or(LoadError::InvalidMapping)?;
+        copy_to_user(&address_space, segment.virtual_address, file_bytes)?;
     }
 
     let stack_start = USER_STACK_TOP

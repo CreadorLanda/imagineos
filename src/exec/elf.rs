@@ -98,7 +98,15 @@ impl<'a> Elf64<'a> {
         if index >= self.program_header_count {
             return Ok(None);
         }
-        let header = self.program_headers + index * self.program_header_size;
+        // Checked arithmetic: in release (overflow checks off) the naive
+        // `+`/`*` could wrap and make `read_u32` inspect the wrong header.
+        let stride = index
+            .checked_mul(self.program_header_size)
+            .ok_or(Error::InvalidProgramHeaders)?;
+        let header = self
+            .program_headers
+            .checked_add(stride)
+            .ok_or(Error::InvalidProgramHeaders)?;
         if read_u32(self.bytes, header)? != PT_LOAD {
             return Ok(None);
         }
@@ -131,8 +139,11 @@ impl<'a> Elf64<'a> {
         }))
     }
 
-    pub fn file_bytes(&self, segment: Segment) -> &'a [u8] {
-        &self.bytes[segment.file_offset..segment.file_offset + segment.file_size]
+    /// Returns `None` instead of panicking when the segment's file range
+    /// is out of bounds or wraps around `usize::MAX`.
+    pub fn file_bytes(&self, segment: Segment) -> Option<&'a [u8]> {
+        let end = segment.file_offset.checked_add(segment.file_size)?;
+        self.bytes.get(segment.file_offset..end)
     }
 
     pub fn program_header_count(&self) -> usize {
@@ -206,7 +217,7 @@ mod tests {
         assert_eq!(elf.entry, 0x400000);
         let segment = elf.segment(0).unwrap().unwrap();
         assert_eq!(segment.virtual_address, 0x400000);
-        assert_eq!(elf.file_bytes(segment), b"testcode");
+        assert_eq!(elf.file_bytes(segment).unwrap(), b"testcode");
     }
 
     #[test]

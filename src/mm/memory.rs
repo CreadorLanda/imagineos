@@ -82,7 +82,9 @@ pub fn allocate_frame() -> Option<Frame> {
         let region = &mut allocator.regions[allocator.current_region];
         if region.next < region.end {
             let physical_address = region.next;
-            region.next += PAGE_SIZE;
+            // Checked: a region ending near u64::MAX must not wrap around
+            // and hand out already-used frames.
+            region.next = region.next.checked_add(PAGE_SIZE)?;
             let virtual_address = physical_address.checked_add(allocator.hhdm_offset)? as *mut u8;
             return Some(Frame {
                 physical_address,
